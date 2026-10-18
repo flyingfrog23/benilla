@@ -26,39 +26,29 @@ const MAXINDEXRK: u32 = 255;
 const MAXARG_BX: usize = (1 << 18) - 1;
 /// 5.1's `MAXARG_sBx`: the longest jump, in 5.1's instructions.
 const MAXARG_SBX: i64 = MAXARG_BX as i64 >> 1;
-/// 5.1's `MAXARG_C`: a `SETLIST` batch number past it takes a second instruction word.
-const MAXARG_C: u32 = (1 << 9) - 1;
 /// `SHRT_MAX`, `registerlocalvar`'s limit on local declarations per function.
 const MAX_LOCVARS: usize = 32767;
 
-/// Compile a chunk into its main function. `ccalls` is the caller's nesting of host calls, which
-/// 5.1 counts toward the parser's level limit (`L->nCcalls`).
-pub fn compile(src: &[u8], chunkname: &[u8], heap: &mut Heap, ccalls: u32) -> R<Rc<Proto>> {
-    crate::parse::parse(src, chunkname, heap, ccalls)
+/// Compile a chunk into its main function. Its limits are its own: the host calls it runs
+/// under count toward none (the client's per-chunk `nestlevel`, `0x6fc9d0`).
+pub fn compile(src: &[u8], chunkname: &[u8], heap: &mut Heap) -> R<Rc<Proto>> {
+    crate::parse::parse(src, chunkname, heap)
 }
 
-/// 5.1's `luaO_int2fb`: a size as a "floating point byte", `eeeeexxx`, rounded up.
+/// 5.0's `luaO_int2fb` (`0x6f5810`): a size as a "floating point byte" `mmmmmxxx`, `xxx * 2^m`,
+/// halved and rounded up while it is 8 or more.
 pub fn int2fb(mut x: u32) -> u32 {
-    let mut e = 0;
-    while x >= 16 {
+    let mut m = 0;
+    while x >= 8 {
         x = (x + 1) >> 1;
-        e += 1;
+        m += 1;
     }
-    if x < 8 {
-        x
-    } else {
-        ((e + 1) << 3) | (x - 8)
-    }
+    (m << 3) | x
 }
 
-/// 5.1's `luaO_fb2int`.
+/// 5.0's `fb2int`, as `OP_NEWTABLE` decodes its `B` (`0x6f8b31`..`0x6f8b41`): `(x & 7) << (x >> 3)`.
 pub fn fb2int(x: u32) -> u32 {
-    let e = (x >> 3) & 31;
-    if e == 0 {
-        x
-    } else {
-        ((x & 7) + 8) << (e - 1)
-    }
+    (x & 7) << (x >> 3)
 }
 
 /// 5.1's `expkind`, with each kind's `info` in it.
@@ -93,6 +83,10 @@ pub(crate) struct Exp {
     pub k: Kind,
     pub t: i32,
     pub f: i32,
+    /// A `KNum` that 5.1 folded and the client's 5.0 computes when it runs: its `luaK_posfix`
+    /// folds no arithmetic (`0x701610`), so the value is an instruction's result there. A `not`
+    /// keeps it: 5.0's is an `OP_NOT` of that result, where 5.1's is a constant.
+    pub rt: bool,
 }
 
 impl Exp {
@@ -101,7 +95,18 @@ impl Exp {
             k,
             t: NO_JUMP,
             f: NO_JUMP,
+            rt: false,
         }
+    }
+
+    /// A numeral 5.1 folded ([`Exp::rt`]).
+    pub fn is_rt_numeral(&self) -> bool {
+        self.rt && matches!(self.k, Kind::KNum(_))
+    }
+
+    /// A constant 5.1 made of what 5.0 computes ([`Exp::rt`]): a folded numeral or its `not`.
+    fn is_rt(&self) -> bool {
+        self.rt && matches!(self.k, Kind::KNum(_) | Kind::True | Kind::False)
     }
 
     fn has_jumps(&self) -> bool {
@@ -210,8 +215,16 @@ pub(crate) struct FuncState {
     /// jump-range limit is 5.1's.
     cpc: Vec<u32>,
     cpc_next: u32,
+    /// The client's 5.0 code size less 5.1's, summed where their code generators emit
+    /// differently ([`FuncState::code_size50`]).
+    c50_delta: i64,
     pub consts: Vec<Value>,
     kmap: KMap,
+    /// The constants the client's 5.0 makes for the same code ([`FuncState::consts50`]).
+    k50: std::collections::HashSet<KKey, std::hash::BuildHasherDefault<KHasher>>,
+    /// The registers of the `OP_LOADNIL` 5.0 emits at the head of the function, where 5.1 emits
+    /// none ([`Parser::nil`]).
+    head_nil50: Option<(Reg, Reg)>,
     pub protos: Vec<Rc<Proto>>,
     /// Each upvalue as `(true, register)` in the enclosing function or `(false, upvalue)`.
     pub upvals: Vec<(bool, u16)>,
@@ -226,6 +239,9 @@ pub(crate) struct FuncState {
     pub maxstack: u8,
     /// [`Proto::c_maxstack`]: `maxstack` as `luaK_checkstack` alone raises it.
     c_maxstack: u8,
+    /// The registers a generic `for`'s call and results reach above its variables, which
+    /// `luaK_checkstack` does not count ([`Proto::maxstack`]).
+    pub tfor_top: u16,
     /// The last pc marked as a jump target (`luaK_getlabel`), in 5.1's count, or -1.
     lasttarget: i64,
     /// `LoadNil`s at the head of the function that 5.1 leaves out (see [`Parser::nil`]).
@@ -248,14 +264,34 @@ pub(crate) struct FuncState {
 }
 
 impl FuncState {
+    /// The code so far as the client's 5.0 would count it: 5.1's words, and per difference of
+    /// the code generators, each at its site: 5.0 folds no arithmetic (`luaK_posfix`,
+    /// `0x701610`) and only a constant's minus (`luaK_prefix`, `0x701445`); its `luaK_exp2RK`
+    /// makes no constant of `true` or `false` (`0x701023`); and its `luaK_goiftrue` jumps on
+    /// `false` (`0x7011ff`) and `luaK_goiffalse` on `true` (`0x7013b4`), where 5.1 tests them.
+    pub(crate) fn code_size50(&self) -> i64 {
+        self.cpc_next as i64 + self.c50_delta
+    }
+
+    /// The constants the client's 5.0 makes for the same code: every string, `nil` where an
+    /// operand takes it, and every numeral as its token is read (`simpleexp`'s `luaK_numberK`)
+    /// and again negated (`luaK_prefix`, `0x701445`); no boolean (`luaK_exp2RK`, `0x701023`) and
+    /// nothing 5.1 folds (`luaK_posfix`, `0x701610`).
+    pub(crate) fn consts50(&self) -> usize {
+        self.k50.len()
+    }
+
     pub fn new(source: Bytes, linedefined: u32, key: Key) -> FuncState {
         FuncState {
             code: Vec::new(),
             lines: Vec::new(),
             cpc: Vec::new(),
             cpc_next: 0,
+            c50_delta: 0,
             consts: Vec::new(),
             kmap: KMap::default(),
+            k50: Default::default(),
+            head_nil50: None,
             protos: Vec::new(),
             upvals: Vec::new(),
             upval_names: Vec::new(),
@@ -266,6 +302,7 @@ impl FuncState {
             freereg: 0,
             maxstack: 2,
             c_maxstack: 2,
+            tfor_top: 0,
             lasttarget: -1,
             silent_nils: 0,
             jpc: NO_JUMP,
@@ -330,6 +367,14 @@ impl FuncState {
             .filter(|&i| self.cpc.get(i + 1).copied().unwrap_or(self.cpc_next) == self.cpc[i])
             .map(|i| i as u32)
             .collect();
+        let code50 = self.code_size50().max(0) as usize;
+        let consts50 = self.consts50();
+        // `luaY_parser` takes the chunk name by `strlen` (`0x6fc9c2`..`0x6fc9df`).
+        let names = std::iter::once(crate::lex::cstr(&self.source))
+            .chain(self.locvars.iter().map(|l| &*l.name))
+            .chain(self.upval_names.iter().map(|n| &**n))
+            .map(|n| heap.str_value(n))
+            .collect();
         Proto {
             code: self.code,
             uncounted,
@@ -342,12 +387,15 @@ impl FuncState {
             nparams: self.nparams,
             vararg: self.vararg,
             clears: self.clears,
-            maxstack: self.maxstack as u16 + 1,
+            maxstack: (self.maxstack as u16 + 1).max(self.tfor_top),
             c_maxstack: self.c_maxstack,
             source_id: heap.source_id(&self.source),
             source: self.source,
             line_defined: self.linedefined,
             locvars: self.locvars,
+            names,
+            code50,
+            consts50,
             key: self.key,
             chunk_keys: Rc::from(Vec::new()),
             gc_mark: Default::default(),
@@ -389,7 +437,6 @@ fn jump_of(op: &Op) -> Option<i32> {
         | Op::JmpCmpKR(_, _, _, o)
         | Op::JmpIf(_, _, o)
         | Op::TestSet(_, _, _, o)
-        | Op::ForPrep(_, o)
         | Op::ForLoop(_, o)
         | Op::ForLoopUp(_, o)
         | Op::TForPrep(_, o) => Some(o),
@@ -405,7 +452,6 @@ fn set_jump(op: &mut Op, off: i32) {
         | Op::JmpCmpKR(_, _, _, o)
         | Op::JmpIf(_, _, o)
         | Op::TestSet(_, _, _, o)
-        | Op::ForPrep(_, o)
         | Op::ForLoop(_, o)
         | Op::ForLoopUp(_, o)
         | Op::TForPrep(_, o) => *o = off,
@@ -453,12 +499,18 @@ fn set_a(op: &mut Op, r: Reg) {
     }
 }
 
+/// A number's constant key: `-0` and `0` are one constant, the first seen.
+fn num_key(n: f64) -> KKey {
+    KKey::Num(if n == 0.0 { 0 } else { n.to_bits() })
+}
+
 fn is_k(x: Rk) -> bool {
     x >= RK_CONST
 }
 
 /// 5.1's `constfolding`: two numerals fold unless the result would be a NaN or a division by
-/// zero is asked for.
+/// zero is asked for. `^` never folds: the client's `^` calls the global `__pow` (`0x6f9b52`),
+/// which a script may replace, so `2 ^ 3` in source calls it too.
 fn fold(op: BinOpr, a: f64, b: f64) -> Option<f64> {
     let r = match op {
         BinOpr::Add => a + b,
@@ -470,8 +522,6 @@ fn fold(op: BinOpr, a: f64, b: f64) -> Option<f64> {
             }
             a / b
         }
-        // `luai_numpow`: C's `pow`, as the VM computes it.
-        BinOpr::Pow => a.powf(b),
         _ => return None,
     };
     (!r.is_nan()).then_some(r)
@@ -726,12 +776,20 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn string_k(&mut self, s: &[u8]) -> R<u32> {
         let r = self.heap.intern(s);
+        self.fs().k50.insert(KKey::Str(r.id));
         self.addk(KKey::Str(r.id), Value::Str(r))
     }
 
+    /// A number constant. The client's 5.0 counts it where its own code makes it
+    /// ([`Parser::number_k50`]), not here: what 5.1 makes of a numeral 5.0 already has, and what
+    /// it makes of a fold 5.0 has not.
     pub(crate) fn number_k(&mut self, n: f64) -> R<u32> {
-        let bits = if n == 0.0 { 0 } else { n.to_bits() };
-        self.addk(KKey::Num(bits), Value::Num(n))
+        self.addk(num_key(n), Value::Num(n))
+    }
+
+    /// A number the client's 5.0 makes a constant of ([`FuncState::consts50`]).
+    pub(crate) fn number_k50(&mut self, n: f64) {
+        self.fs().k50.insert(num_key(n));
     }
 
     fn bool_k(&mut self, b: bool) -> R<u32> {
@@ -739,6 +797,7 @@ impl<'a> Parser<'a> {
     }
 
     fn nil_k(&mut self) -> R<u32> {
+        self.fs().k50.insert(KKey::Nil);
         self.addk(KKey::Nil, Value::Nil)
     }
 
@@ -762,11 +821,26 @@ impl<'a> Parser<'a> {
         let fs = self.fsr();
         if fs.cpc_next as i64 > fs.lasttarget {
             if fs.cpc_next == 0 {
+                // The client's 5.0 emits these (its `lasttarget` starts at 0, `0x6fcaba`, so its
+                // `luaK_nil` at pc 0 has no previous to widen, `0x700798`), one `OP_LOADNIL`
+                // widened while each follows on.
+                let fs = self.fs();
+                match fs.head_nil50 {
+                    Some((pfrom, pto)) if pfrom <= from && from as u32 <= pto as u32 + 1 => {
+                        fs.head_nil50 = Some((pfrom, to.max(pto)));
+                    }
+                    _ => {
+                        fs.c50_delta += 1;
+                        fs.head_nil50 = Some((from, to));
+                    }
+                }
                 if from >= fs.nactvar {
                     self.code(Op::LoadNil(from, to), 0)?;
                     self.fs().silent_nils += 1;
                     return Ok(());
                 }
+                // A local's register: 5.1 emits it, which 5.0 widened its own into or emitted.
+                self.fs().c50_delta -= 1;
             } else if let Some(&Op::LoadNil(pfrom, pto)) = fs.code.last() {
                 if pfrom <= from && from as u32 <= pto as u32 + 1 {
                     if to > pto {
@@ -829,12 +903,20 @@ impl<'a> Parser<'a> {
         match e.k {
             Kind::Nil => self.nil(reg, 1)?,
             Kind::False | Kind::True => {
+                if e.rt {
+                    // 5.0 names the register its `OP_NOT` writes.
+                    self.fs().c50_delta -= 1;
+                }
                 self.code(Op::LoadBool(reg, e.k == Kind::True), 1)?;
             }
             Kind::K(k) => {
                 self.code(Op::LoadK(reg, k), 1)?;
             }
             Kind::KNum(n) => {
+                if e.rt {
+                    // 5.0 names the register its instruction writes.
+                    self.fs().c50_delta -= 1;
+                }
                 let k = self.number_k(n)?;
                 self.code(Op::LoadK(reg, k), 1)?;
             }
@@ -951,7 +1033,13 @@ impl<'a> Parser<'a> {
                     let k = match e.k {
                         Kind::Nil => self.nil_k()?,
                         Kind::KNum(n) => self.number_k(n)?,
-                        k => self.bool_k(k == Kind::True)?,
+                        k => {
+                            // 5.0 loads a boolean into a register, or has its `OP_NOT` there.
+                            if !e.rt {
+                                self.fs().c50_delta += 1;
+                            }
+                            self.bool_k(k == Kind::True)?
+                        }
                     };
                     e.k = Kind::K(k);
                     return Ok(k as Rk + RK_CONST);
@@ -1051,6 +1139,17 @@ impl<'a> Parser<'a> {
     /// `luaK_goiftrue`: falls through when `e` is true, its false jumps kept.
     pub(crate) fn goiftrue(&mut self, e: &mut Exp) -> R<()> {
         self.dischargevars(e)?;
+        if e.is_rt_numeral() {
+            // 5.0 tests the register: `OP_TEST` and its jump.
+            self.fs().c50_delta += 2;
+        } else if e.k == Kind::False {
+            // 5.0 always jumps (`0x7011ff`): one `OP_JMP` for 5.1's load, test and jump. For an
+            // `OP_NOT` it tests the operand instead, as many, the load counted at the discharge.
+            self.fs().c50_delta -= if e.rt { 1 } else { 2 };
+        } else if e.k == Kind::True && e.rt {
+            // 5.0 drops its `OP_NOT` for a test and its jump (`0x7012be`, `0x7012d9`).
+            self.fs().c50_delta += 1;
+        }
         let pc = match e.k {
             Kind::K(_) | Kind::KNum(_) | Kind::True => NO_JUMP,
             Kind::Jmp(pc) => {
@@ -1070,6 +1169,14 @@ impl<'a> Parser<'a> {
     /// `luaK_goiffalse`.
     fn goiffalse(&mut self, e: &mut Exp) -> R<()> {
         self.dischargevars(e)?;
+        if e.k == Kind::True {
+            // 5.0 always jumps (`0x7013b4`): one `OP_JMP` for 5.1's load, test and jump. For an
+            // `OP_NOT` it tests the operand instead, as many, the load counted at the discharge.
+            self.fs().c50_delta -= if e.rt { 1 } else { 2 };
+        } else if e.k == Kind::False && e.rt {
+            // 5.0 drops its `OP_NOT` for a test and its jump (`0x7012be`, `0x7012d9`).
+            self.fs().c50_delta += 1;
+        }
         let pc = match e.k {
             Kind::Nil | Kind::False => NO_JUMP,
             Kind::Jmp(pc) => pc as i32,
@@ -1085,6 +1192,10 @@ impl<'a> Parser<'a> {
 
     fn codenot(&mut self, e: &mut Exp) -> R<()> {
         self.dischargevars(e)?;
+        if e.is_rt() {
+            // 5.0's `OP_NOT` of the register; the result stays one ([`Exp::rt`]).
+            self.fs().c50_delta += 1;
+        }
         match e.k {
             Kind::Nil | Kind::False => e.k = Kind::True,
             Kind::K(_) | Kind::KNum(_) | Kind::True => e.k = Kind::False,
@@ -1119,7 +1230,10 @@ impl<'a> Parser<'a> {
     fn codearith(&mut self, op: BinOpr, e1: &mut Exp, e2: &mut Exp) -> R<()> {
         if let (Some(a), Some(b)) = (e1.is_numeral(), e2.is_numeral()) {
             if let Some(r) = fold(op, a, b) {
+                // 5.0's arithmetic instruction.
+                self.fs().c50_delta += 1;
                 e1.k = Kind::KNum(r);
+                e1.rt = true;
                 return Ok(());
             }
         }
@@ -1198,6 +1312,13 @@ impl<'a> Parser<'a> {
         match op {
             UnOpr::Minus => {
                 if let Some(n) = e.is_numeral() {
+                    if e.rt {
+                        // 5.0's `OP_UNM` of an instruction's result.
+                        self.fs().c50_delta += 1;
+                    } else {
+                        // 5.0's constant of the negated numeral.
+                        self.number_k50(-n);
+                    }
                     e.k = Kind::KNum(-n);
                     return Ok(());
                 }
@@ -1281,15 +1402,15 @@ impl<'a> Parser<'a> {
     /// `luaK_setlist`: list items `base + 1..` stored into the table at `base`, `nelems` of them
     /// so far, the last `tostore` pending (-1: up to the top).
     pub(crate) fn setlist(&mut self, base: Reg, nelems: u32, tostore: i32) -> R<()> {
-        let c = (nelems - 1) / FIELDS_PER_FLUSH + 1;
-        let first = (c - 1) * FIELDS_PER_FLUSH;
-        let words = if c <= MAXARG_C { 1 } else { 2 };
+        // The batch's base, as `OP_SETLIST` clears the low bits of `Bx = nelems - 1` (`0x6f9593`):
+        // a word every 32 items, as the client's 5.0 emits them.
+        let first = (nelems - 1) / FIELDS_PER_FLUSH * FIELDS_PER_FLUSH;
         let op = if tostore < 0 {
             Op::SetListTop(base, first)
         } else {
             Op::SetList(base, first, tostore as u16)
         };
-        self.code(op, words)?;
+        self.code(op, 1)?;
         self.fs().freereg = base + 1;
         Ok(())
     }
@@ -1335,13 +1456,16 @@ mod tests {
     use super::*;
 
     #[test]
-    /// 5.1's floating point bytes: exact below 16, then rounded up to 4 significant bits.
-    fn constructor_hints_are_5_1_s() {
-        assert_eq!(fb2int(int2fb(9)), 9);
-        assert_eq!(fb2int(int2fb(7)), 7);
-        assert_eq!(fb2int(int2fb(15)), 15);
-        assert_eq!(fb2int(int2fb(17)), 18);
-        assert_eq!(fb2int(int2fb(33)), 36);
+    /// 5.0's floating point bytes (`0x6f5810`): exact below 8, then rounded up to 3 significant
+    /// bits, where 5.1's keep 4.
+    fn constructor_hints_are_5_0_s() {
         assert_eq!(fb2int(int2fb(0)), 0);
+        assert_eq!(fb2int(int2fb(7)), 7);
+        assert_eq!(fb2int(int2fb(8)), 8);
+        assert_eq!(fb2int(int2fb(9)), 10);
+        assert_eq!(fb2int(int2fb(15)), 16);
+        assert_eq!(fb2int(int2fb(17)), 20);
+        assert_eq!(fb2int(int2fb(33)), 40);
+        assert_eq!(int2fb(6), 6);
     }
 }

@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use mlua::{Lua, MultiValue, Table, Value};
 
+use super::binding_abi::{optional_string, usage};
 use super::object::frame_handle_of;
 use super::Model;
 use crate::widget::{model_key, FrameHandle, KindState, ModelFileFacts, ModelLight, ModelState};
@@ -73,10 +74,16 @@ impl Model {
         self.apply_implicit_rect(h);
     }
 
-    /// `SetCamera(idx)` on the pane `h` (`0x76cec0`), against the facts of the file it holds.
+    /// `SetCamera(idx)` on the pane `h` (`0x76cec0`): on a character pane's copy, else against
+    /// the facts of the file it holds.
     pub(crate) fn set_pane_camera(&mut self, h: FrameHandle, idx: i32) {
-        let path = match self.arena.frame(h).map(|f| &f.kind_state) {
-            Some(KindState::Model(m)) => m.path.clone(),
+        let path = match self.arena.frame_mut(h).map(|f| &mut f.kind_state) {
+            Some(KindState::Model(m)) => {
+                if m.character.as_mut().is_some_and(|c| c.set_camera(idx)) {
+                    return;
+                }
+                m.path.clone()
+            }
             _ => return,
         };
         let facts = path.and_then(|p| self.model_facts_for(&p));
@@ -297,32 +304,6 @@ fn parse_set_light(a: &[Value]) -> SetLight {
     SetLight::Set(light)
 }
 
-/// A string argument as `lua_isstring` gates it: a string or a number (tags 3 and 4), the number
-/// rendered as decimal text.
-fn string_arg(v: &Value) -> Option<std::borrow::Cow<'_, str>> {
-    match v {
-        Value::String(s) => s
-            .to_str()
-            .ok()
-            .map(|t| std::borrow::Cow::Owned(t.to_string())),
-        Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-        Value::Integer(i) => Some(std::borrow::Cow::Owned(i.to_string())),
-        _ => None,
-    }
-}
-
-/// The client's `Usage:` error, naming the receiver by `GetName()` or `<unnamed>` (`0x84c7f0`).
-fn usage(lua: &Lua, this: &Table, call: &str) -> mlua::Error {
-    let name = this
-        .get::<mlua::Function>("GetName")
-        .and_then(|f| f.call::<Option<String>>(this.clone()))
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "<unnamed>".to_string());
-    let _ = lua;
-    mlua::Error::runtime(format!("Usage: {name}:{call}"))
-}
-
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let m = lua.create_table()?;
 
@@ -338,9 +319,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "SetModel",
         lua.create_function(|lua, (this, path): (Table, Value)| {
-            let path = string_arg(&path)
-                .ok_or_else(|| usage(lua, &this, "SetModel(\"file\")"))?
-                .to_string();
+            // `lua_isstring` then `lua_tostring` (`0x76d9dc`, `0x76d9ec`).
+            let path = optional_string(lua, &path)
+                .ok_or_else(|| usage(lua, &this, "SetModel(\"file\")"))?;
             // A pane of this kind, or the error.
             with_model(lua, &this, |_| ())?;
             let h = frame_handle_of(lua, &this)?;
@@ -414,7 +395,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     // `SetCamera(n)` (`0x76e0e0` → `0x76cec0`) picks a camera by raw table index, not through
     // `cameraLookup`; past the table it installs the NULL (orthographic) camera, and until the
-    // facts arrive the pane draws nothing.
+    // facts arrive the pane draws nothing. `PlayerModel` adds no `SetCamera` (`0x84f1fc`), so a
+    // character pane's copy takes this one, until its next build installs the pane's own.
     m.set(
         "SetCamera",
         lua.create_function(|lua, (this, c): (Table, Value)| {
@@ -557,10 +539,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "ReplaceIconTexture",
         lua.create_function(|lua, (this, path): (Table, Value)| {
-            let Some(path) = string_arg(&path) else {
+            // `lua_isstring` then `lua_tostring` (`0x76edfc`, `0x76ee0d`).
+            let Some(path) = optional_string(lua, &path) else {
                 return Err(usage(lua, &this, "ReplaceIconTexture(\"texture\")"));
             };
-            let path = path.to_string();
             with_model(lua, &this, |m| {
                 if m.path.is_some() {
                     m.icon = Some(path);
@@ -586,9 +568,9 @@ pub(super) fn install_player_model(lua: &Lua) -> mlua::Result<()> {
         "SetUnit",
         lua.create_function(|lua, (this, unit): (Table, Value)| {
             with_model(lua, &this, |_| ())?;
-            let token = string_arg(&unit)
-                .ok_or_else(|| mlua::Error::runtime(SET_UNIT_USAGE))?
-                .to_string();
+            // `lua_isstring` then `lua_tostring` (`0x505dfc`, `0x505e20`).
+            let token =
+                optional_string(lua, &unit).ok_or_else(|| mlua::Error::runtime(SET_UNIT_USAGE))?;
             let h = frame_handle_of(lua, &this)?;
             let guid = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
@@ -703,6 +685,7 @@ impl crate::script::UiScript {
                     pending: c.pending(),
                     copy: c.copy,
                     file: m.path.is_some(),
+                    camera: c.view_camera(),
                     facing: m.facing,
                     light: m.light,
                     fog: m.scene_fog(),
@@ -897,6 +880,8 @@ pub struct CharacterPaneFrame {
     pub copy: Option<crate::widget::PaneCopy>,
     /// A file `SetModel` put at `+0x318` since the last copy: the pane draws that, not a copy.
     pub file: bool,
+    /// The camera the copy draws through (`+0x31c`).
+    pub camera: crate::widget::CopyCamera,
     /// The facing, the root's yaw (`+0x39c`).
     pub facing: f32,
     /// The pane's light and the fog its scene draws with.

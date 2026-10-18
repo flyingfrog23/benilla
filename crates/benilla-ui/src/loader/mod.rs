@@ -8,12 +8,13 @@
 //! Lua handles are never accumulated breadth-wise (MAXCSTACK): a frame's wrapper and `OnLoad`
 //! live only across its own subtree build, and everything durable lives Lua-side.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use mlua::{Function, ObjectLike, Table, Value};
 
 use crate::framexml::{self, Element, ParsedDocument, ScriptRef, TopLevel};
-use crate::script::{FontObject, JustifyH, JustifyV, Outline, UiScript};
+use crate::justify;
+use crate::script::{Outline, UiScript};
 use crate::status;
 
 mod backdrop;
@@ -199,13 +200,15 @@ pub fn apply_template(lua: &mlua::Lua, wrapper: &Table, kind: &str, template: &s
     loader.report.warnings.extend(notes);
 
     // The XML `inherits=` expansion; its warnings get the `CreateFrame` call as a prefix.
+    let node = framexml::inherits_node(kind, template);
     let first = loader.report.warnings.len();
-    let expanded = loader.expand(&framexml::inherits_node(kind, template));
+    let expanded = loader.expand(&node);
     for w in &mut loader.report.warnings[first..] {
         *w = format!("{dbg}: {w}");
     }
+    let levels = loader.levels(&node);
 
-    loader.decorate(&expanded, wrapper, &self_name, &parent_name, &dbg);
+    loader.decorate(&expanded, &levels, wrapper, &self_name, &parent_name, &dbg);
 
     loader.report
 }
@@ -247,6 +250,11 @@ impl Loader<'_> {
         status::install_path(&format!("{}{path}", self.status_root))
     }
 
+    /// Mark the loader's `CreateFrame` call, the builder's creation half (`Model::xml_creating`).
+    fn set_xml_creating(&self, on: bool) {
+        self.model().xml_creating = on;
+    }
+
     /// `FrameXML_Debug` above 0, read where the reference reads it, at each close.
     fn debug(&self) -> bool {
         self.model().framexml_debug.get() > 0
@@ -273,7 +281,7 @@ struct Loader<'a> {
     pub(super) status_root: &'a str,
     // The template and font registries live on the `Model` and persist across loads: the
     // reference's template table is global (`0x6ee500`), so `MerchantFrame.xml` inherits a template
-    // `CharacterFrameTemplates.xml` registered. Fonts are their own namespace, stored flattened.
+    // `CharacterFrameTemplates.xml` registered. Fonts are their own namespace.
     pub(super) report: LoadReport,
     /// Warn-once keys.
     pub(super) warned: HashSet<String>,
@@ -282,6 +290,45 @@ struct Loader<'a> {
     /// target built later waits here (`ClassTrainerFrameTemplates.xml:67` hangs the label off the
     /// highlight). Each `decorate` drains its own.
     pub(super) deferred_anchors: Vec<DeferredAnchor>,
+}
+
+/// The nodes an element's `LoadXML` reads, in the order it reads them: the reference merges no
+/// template into an instance, but re-enters `LoadXML` on each `inherits` node first (`0x76985c`
+/// for a frame, `0x76fe5b` for a texture, `0x770f9e` for a FontString), then reads the node's own
+/// attributes and its own first child of each kind (`0x6f2c50`). So an attribute whose rule is
+/// local to a node (`setAllPoints` beside the node's own `<Anchors>`, a `font=` with its own
+/// `<FontHeight>`) is read level by level, the template first and the element last;
+/// [`Loader::expand`]'s merged element serves the rest. The templates are shared with the
+/// registry, not copied.
+pub(super) struct Levels<'a> {
+    inherited: Vec<std::rc::Rc<Element>>,
+    own: &'a Element,
+}
+
+type LevelIter<'l> = std::iter::Chain<
+    std::iter::Map<
+        std::slice::Iter<'l, std::rc::Rc<Element>>,
+        fn(&std::rc::Rc<Element>) -> &Element,
+    >,
+    std::iter::Once<&'l Element>,
+>;
+
+impl Levels<'_> {
+    pub(super) fn iter(&self) -> LevelIter<'_> {
+        let shared: fn(&std::rc::Rc<Element>) -> &Element = |e| e;
+        self.inherited
+            .iter()
+            .map(shared)
+            .chain(std::iter::once(self.own))
+    }
+}
+
+impl<'l> IntoIterator for &'l Levels<'_> {
+    type Item = &'l Element;
+    type IntoIter = LevelIter<'l>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 /// One `SetPoint` held until its target exists.
@@ -333,7 +380,20 @@ impl Loader<'_> {
         wrapper: &mlua::Table,
         func: &mlua::Function,
     ) -> mlua::Result<()> {
-        crate::script::event::invoke_with_globals(self.lua, wrapper.clone(), func, None, Vec::new())
+        crate::script::event::invoke_with_globals(self.lua, wrapper.clone(), func, Vec::new())
+    }
+
+    /// An object's name as the reference's load lines print it: its own name (vtable `+4`), else
+    /// `<unnamed>` (`0x84c7f0`).
+    pub(super) fn object_name(&self, wrapper: &Table) -> String {
+        crate::script::binding_abi::name_of(self.lua, wrapper)
+    }
+
+    /// A severity-1 line into the document's record, the status object's `+0xc` slot every
+    /// `LoadXML` logs through, retained as a warning too.
+    pub(super) fn status_warning(&mut self, line: String) {
+        self.report.status.report(status::WARNING, line.clone());
+        self.report.warnings.push(line);
     }
 
     pub(super) fn warn_once(&mut self, key: &str, msg: impl Into<String>) {
@@ -343,12 +403,13 @@ impl Loader<'_> {
     }
 
     /// Resolve `text=` as a global-string key (`FrameScript_GetText 0x703bf0`), so
-    /// `GlobalStrings.lua` must run before any XML. A miss comes back empty (`0x882748`) and all
-    /// three `text=` readers then show the raw value (`0x778c07`, `0x771006`, `0x7292a6`). The
-    /// warning on a key-shaped miss is benilla's own.
+    /// `GlobalStrings.lua` must run before any XML. A miss comes back empty (`0x882748`), and all
+    /// three `text=` readers show the raw value for an empty answer (`0x771032`, `0x778c31`,
+    /// `0x7292a6`), so a global holding `""` shows its key. The warning on a key-shaped miss is
+    /// benilla's own.
     pub(super) fn resolve_text(&mut self, raw: &str, dbg: &str) -> String {
         if let Ok(s) = self.lua().globals().get::<String>(raw) {
-            return s;
+            return if s.is_empty() { raw.to_string() } else { s };
         }
         if is_global_string_key(raw) {
             self.warn_once(
@@ -408,8 +469,7 @@ impl Loader<'_> {
                 TopLevel::Font(el) => self.do_font(el),
                 TopLevel::Template(el) => self.register_template(el),
                 TopLevel::Instance(el) => {
-                    let expanded = self.expand(el);
-                    self.materialize(&expanded, None, framexml::DEFAULT_PARENT_NAME);
+                    self.materialize(el, None, framexml::DEFAULT_PARENT_NAME);
                 }
             }
         }
@@ -503,33 +563,40 @@ impl Loader<'_> {
         let model = self.model();
         let templates = model.framexml_templates.borrow();
         // A font object in an inherit chain is skipped, not warned as an unknown template.
-        let fonts = model.framexml_fonts.borrow();
-        let font_names: std::collections::HashSet<&str> =
-            fonts.keys().map(|k| k.as_str()).collect();
+        let is_font = |name: &str| model.fonts.id(name).is_some();
         let mut warns = Vec::new();
-        let out = framexml::expand_known(el, &*templates, &font_names, &mut warns);
-        drop(font_names);
-        drop(fonts);
+        let out = framexml::expand_known(el, &*templates, &is_font, &mut warns);
         drop(templates);
         drop(model);
         self.report.warnings.extend(warns);
         out
     }
 
-    /// The `file=` loads of a texture region, in the order the reference runs them
-    /// (`0x76fe20`): each `inherits` level's own file with the wrap flag of that level's own
-    /// `<TexCoords>` (the flag is a local of the level's load, zeroed before its children,
-    /// `0x76fec6`), the template first. A level without a `file=` loads nothing.
-    pub(super) fn texture_file_loads(&self, raw: &Element) -> Vec<(String, bool)> {
+    /// The nodes `raw`'s `LoadXML` reads ([`Levels`]).
+    pub(super) fn levels<'a>(&self, raw: &'a Element) -> Levels<'a> {
+        let inherited = self
+            .model()
+            .framexml_templates
+            .borrow()
+            .inherited_levels(raw);
+        Levels {
+            inherited,
+            own: raw,
+        }
+    }
+
+    /// The nodes a FontString's `LoadXML` reads: [`Self::levels`], up to the first `inherits` that
+    /// names a font, which the string links instead of loading a template (`0x770f69`).
+    pub(super) fn fontstring_levels<'a>(&self, raw: &'a Element) -> Levels<'a> {
         let model = self.model();
-        let templates = model.framexml_templates.borrow();
-        framexml::inherit_chain(raw, &*templates)
-            .into_iter()
-            .filter_map(|level| {
-                let file = level.attr("file").filter(|f| !f.is_empty())?;
-                Some((file.to_string(), tex_coords_wrap(level)))
-            })
-            .collect()
+        let inherited = model
+            .framexml_templates
+            .borrow()
+            .inherited_levels_until(raw, |name| model.fonts.id(name).is_some());
+        Levels {
+            inherited,
+            own: raw,
+        }
     }
 
     /// [`Loader::expand`] for a region, only when `inherits=` names a registered element template:
@@ -546,54 +613,153 @@ impl Loader<'_> {
         }
     }
 
-    /// A top-level `<Font name=…>`: flatten its `inherits=` chain (fonts inherit only fonts),
-    /// register the [`FontObject`] and store the flattened element for later fonts to inherit.
+    /// A top-level `<Font name=…>`: the named object, made if new and kept with its followers if
+    /// re-declared (`0x783870`, `0x7839ab`), loads the node ([`Self::load_font_node`]) and is
+    /// published whether or not its own font was refused.
     pub(super) fn do_font(&mut self, el: &Element) {
         let Some(name) = el.name().map(str::to_string) else {
             return;
         };
-        let merged = {
-            let model = self.model();
-            let fonts = model.framexml_fonts.borrow();
-            let view: HashMap<&str, &Element> =
-                fonts.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            let mut warns = Vec::new();
-            let merged = framexml::expand(el, &view, &mut warns);
-            drop(view);
-            drop(fonts);
-            drop(model);
-            self.report.warnings.extend(warns);
-            merged
-        };
-
-        let font = font_object_from_element(&merged);
-        {
-            let mut model = self.model();
-            model
-                .font_objects_by_lower
-                .insert(name.to_ascii_lowercase(), font);
-            model
-                .framexml_fonts
-                .borrow_mut()
-                .insert(name.clone(), merged);
-        }
+        let id = self.model().fonts.named(&name);
+        self.load_font_node(el, id, &name);
         // In 1.12 a named `<Font>` is also a Lua global, the object `SetFontObject` takes.
-        if let Err(e) = crate::script::font::publish(self.lua(), &name) {
+        if let Err(e) = crate::script::font::publish(self.lua(), id, &name) {
             self.report
                 .warnings
                 .push(format!("<Font name=\"{name}\">: {e}"));
         }
     }
 
-    /// Build one template-expanded frame element, its nested `<Frames>`, then its `OnLoad`
+    /// `CSimpleFont::LoadXML 0x783c30` on font `id`, `name` naming it in the warnings: `inherits=`
+    /// links it to that font (`0x783ce6`; a miss is logged, `0x87a51c`), a `font=` naming a font
+    /// links it there instead (`0x783d22`), and any other `font=` is a file that needs the node's
+    /// own first `<FontHeight>` above 0 and sets the flags word whole from `outline=` and
+    /// `monochrome=` (`0x783db1`-`0x783ea3`) when it loads; without the height the load stops
+    /// (`0x783dae`). Then `spacing=` with `atof` (`0x783ee0`), `justifyV`, `justifyH` and each
+    /// `<Color>` and `<Shadow>` child, the last of each winning. Each attribute is a setter's write,
+    /// clearing its inherit bit (`0x783ea9`-`0x784100`) and pushing to what already follows the
+    /// font.
+    pub(super) fn load_font_node(
+        &mut self,
+        el: &Element,
+        id: crate::script::font::FontId,
+        name: &str,
+    ) {
+        use crate::script::{font, FontMask};
+        if let Some(parent) = el.attr("inherits").filter(|n| !n.is_empty()) {
+            let to = self.model().fonts.id(parent);
+            match to {
+                Some(to) => self.link_font_node(id, to, name),
+                None => self.status_warning(format!("Couldn't find inherited font: {parent}")),
+            }
+        }
+        match el.attr("font").filter(|f| !f.is_empty()) {
+            Some(f) if self.model().fonts.id(f).is_some() => {
+                let to = self.model().fonts.id(f).expect("tested");
+                self.link_font_node(id, to, name);
+            }
+            Some(path) => {
+                let height = children_named(el, "FontHeight")
+                    .next()
+                    .and_then(abs_value)
+                    .filter(|h| *h > 0.0);
+                let Some(height) = height else {
+                    self.report_missing_font_height("Font", name, &el.tag);
+                    return;
+                };
+                let outline = el.attr("outline").map(Outline::parse).unwrap_or_default();
+                // Any non-empty `monochrome=` sets the flag (`0x783e01`-`0x783e14`), even "false".
+                let monochrome = el.attr("monochrome").is_some_and(|v| !v.is_empty());
+                // The font the node already holds (the path ignoring case, the height within 2⁻²²,
+                // the same flags) is kept as spelled and still clears the bit (`0x783e17`-`0x783e5d`
+                // → `0x783ea9`); any other loads first (`0x783e7c`). A file that fails is logged
+                // (`0x87a4c8`) and the node goes on to `spacing`, keeping what it follows.
+                let mut model = self.model();
+                let fo = &model.fonts.get(id).block;
+                let held = fo
+                    .font
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(path))
+                    && fo
+                        .height
+                        .is_some_and(|h| (h - height).abs() < crate::script::SAME_FONT_HEIGHT)
+                    && (fo.outline, fo.monochrome) == (outline, monochrome);
+                if held || crate::script::face_loads(&model, path) {
+                    font::set(&mut model, id, FontMask::FONT, |fo| {
+                        if !held {
+                            fo.font = Some(path.to_string());
+                            fo.height = Some(height);
+                            fo.outline = outline;
+                            fo.monochrome = monochrome;
+                        }
+                    });
+                } else {
+                    drop(model);
+                    self.status_warning(format!("Font {name}: Unable to load font file {path}"));
+                }
+            }
+            None => {}
+        }
+        let mut model = self.model();
+        if let Some(sp) = el.attr("spacing").filter(|v| !v.is_empty()) {
+            let sp = crate::framexml::atof(sp);
+            font::set(&mut model, id, FontMask::SPACING, |fo| {
+                fo.spacing = Some(sp)
+            });
+        }
+        // Each axis matches its token as `0x6f1990` does and writes its own bits of the one justify
+        // word, none for the other axis's token (`0x783f75`-`0x783f7c`, `0x783fbd`-`0x783fc4`); a
+        // token that matches nothing is skipped and clears no bit (`0x783f6d`, `0x783fb5`).
+        for (attr, mask) in [("justifyV", justify::V_MASK), ("justifyH", justify::H_MASK)] {
+            let Some(bits) = el.attr(attr).and_then(justify::parse_bits) else {
+                continue;
+            };
+            font::set(&mut model, id, FontMask::JUSTIFY, |fo| {
+                let word = fo.justify.get_or_insert_with(Default::default);
+                word.0 = justify::set_axis(word.0, mask, bits);
+            });
+        }
+        for child in &el.children {
+            if child.tag.eq_ignore_ascii_case("Color") {
+                let c = color_of(child);
+                font::set(&mut model, id, FontMask::COLOR, |fo| fo.color = Some(c));
+            } else if child.tag.eq_ignore_ascii_case("Shadow") {
+                let sh = shadow_of(child);
+                font::set(&mut model, id, FontMask::SHADOW, |fo| fo.shadow = Some(sh));
+            }
+        }
+    }
+
+    /// Link font `id` to `to` for an XML attribute. Deviation: a link that would close a loop is
+    /// refused and reported; the reference's XML legs (`0x783ce6`, `0x783d22`) check nothing, and
+    /// the next push down such a loop would never end.
+    fn link_font_node(
+        &mut self,
+        id: crate::script::font::FontId,
+        to: crate::script::font::FontId,
+        name: &str,
+    ) {
+        use crate::script::font;
+        let mut model = self.model();
+        if font::would_loop(&model, id, to) {
+            drop(model);
+            self.status_warning(format!("Font {name}: can't create a font object loop"));
+            return;
+        }
+        font::link_font(&mut model, id, Some(to));
+    }
+
+    /// Build one frame element, template-expanded, its nested `<Frames>`, then its `OnLoad`
     /// (bottom-up, `0x76a060`). `parent` is the lexically enclosing frame, which `parent=`
     /// overrides; `None` when the frame type is unknown, which skips the subtree.
     pub(super) fn materialize(
         &mut self,
-        el: &Element,
+        raw: &Element,
         parent: Option<&Table>,
         parent_name: &str,
     ) -> Option<Table> {
+        let expanded = self.expand(raw);
+        let el = &expanded;
         // Only creation lives here: everything after `CreateFrame` is `decorate`, which
         // `apply_template` enters for a frame that already exists.
 
@@ -663,21 +829,23 @@ impl Loader<'_> {
                 return None;
             }
         };
-        let wrapper: Table =
-            match create.call((el.tag.clone(), resolved_name.clone(), parent.cloned())) {
-                Ok(w) => w,
-                Err(e) => {
-                    self.report.fault(format!(
-                        "CreateFrame(<{}>{}): {e}",
-                        el.tag,
-                        resolved_name
-                            .as_deref()
-                            .map(|n| format!(" name=\"{n}\""))
-                            .unwrap_or_default()
-                    ));
-                    return None;
-                }
-            };
+        self.set_xml_creating(true);
+        let made = create.call::<Table>((el.tag.clone(), resolved_name.clone(), parent.cloned()));
+        self.set_xml_creating(false);
+        let wrapper: Table = match made {
+            Ok(w) => w,
+            Err(e) => {
+                self.report.fault(format!(
+                    "CreateFrame(<{}>{}): {e}",
+                    el.tag,
+                    resolved_name
+                        .as_deref()
+                        .map(|n| format!(" name=\"{n}\""))
+                        .unwrap_or_default()
+                ));
+                return None;
+            }
+        };
         self.report.frames += 1;
 
         let dbg_name = resolved_name
@@ -695,17 +863,21 @@ impl Loader<'_> {
         // `$parent` for its contents; a nameless frame passes its nearest named ancestor on.
         let self_name = resolved_name.as_deref().unwrap_or(parent_name).to_string();
 
-        self.decorate(el, &wrapper, &self_name, parent_name, &dbg_name);
+        let levels = self.levels(raw);
+        self.decorate(el, &levels, &wrapper, &self_name, parent_name, &dbg_name);
         Some(wrapper)
     }
 
     /// Everything a frame element does to an existing frame, from `LoadXML` attributes to its
     /// `OnLoad` (bottom-up, `0x76a060`) and the post-load OnShow; shared by [`Self::materialize`] and
-    /// [`apply_template`]. `$parent` is `self_name` in this frame's contents and `parent_name` in
+    /// [`apply_template`]. `el` is the template-expanded element and `levels` the nodes it merges
+    /// ([`Loader::levels`]). `$parent` is `self_name` in this frame's contents and `parent_name` in
     /// its own anchors (`0x76c5b0`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn decorate(
         &mut self,
         el: &Element,
+        levels: &Levels,
         wrapper: &Table,
         self_name: &str,
         parent_name: &str,
@@ -717,10 +889,12 @@ impl Loader<'_> {
         //      hook, its own OnShow and OnHide fire nothing.
         crate::script::visibility::set_load_window(self.lua(), wrapper, true);
         // 2 · LoadXML attributes (`0x769820`).
-        self.apply_attrs(el, wrapper, dbg_name);
-        // 3 · <Size> and 4 · <Anchors> (the CLayoutFrame geometry base, `0x767800`).
-        self.apply_size(el, wrapper, dbg_name);
-        self.apply_anchors(el, wrapper, parent_name, dbg_name);
+        self.apply_attrs(el, levels, wrapper, dbg_name);
+        // 3 · <Size> and 4 · <Anchors>, each level's own (the CLayoutFrame geometry base,
+        //     `0x767800`).
+        for level in levels {
+            self.apply_geometry(level, wrapper, false, parent_name, dbg_name);
+        }
         // 5 · <Layers> regions (`0x769d70`) and the <Backdrop> plate (`0x77e6c0`), whose nine
         //     pieces are regions too, in document order: both are arms of the one child loop
         //     (`0x769b1c`), so the order they link into `GetRegions` is the file's. A template's
@@ -739,14 +913,13 @@ impl Loader<'_> {
         self.apply_title_region(el, wrapper, self_name, dbg_name);
         // 5b · per-kind LoadXML extras (EditBox `0x779fb0`), each gated on the element's own tag,
         //      so a Frame wearing a <Button> template skips the Button steps.
-        self.apply_statusbar(el, wrapper, self_name, dbg_name);
-        self.apply_slider(el, wrapper, self_name, dbg_name);
+        self.apply_statusbar(el, levels, wrapper, self_name, dbg_name);
+        self.apply_slider(el, levels, wrapper, self_name, dbg_name);
         self.apply_colorselect(el, wrapper, self_name, dbg_name);
-        self.apply_button(el, wrapper, self_name, dbg_name);
+        self.apply_button(el, levels, wrapper, self_name, dbg_name);
         self.apply_editbox(el, wrapper, dbg_name);
         self.apply_messageframe(el, wrapper, dbg_name);
         self.apply_simplehtml(el, wrapper, dbg_name);
-        self.apply_minimap(el, wrapper, dbg_name);
         // 6 · <Scripts> handlers (`0x769ef0`); OnLoad is captured to fire bottom-up below.
         let onload = self.apply_scripts(el, wrapper, dbg_name);
         // 6b · a ScrollFrame's <ScrollChild> (`0x786bc0`, after the base load `0x769820`): still
@@ -759,8 +932,7 @@ impl Loader<'_> {
         crate::script::tooltip_post_load(self.lua(), wrapper);
         for frames_el in children_named(el, "Frames") {
             for child in &frames_el.children {
-                let expanded = self.expand(child);
-                self.materialize(&expanded, Some(wrapper), self_name);
+                self.materialize(child, Some(wrapper), self_name);
             }
         }
 
@@ -772,6 +944,9 @@ impl Loader<'_> {
         }
         // 9 · and its OnShow, if it is visible now (`0x76a3b3`).
         crate::script::visibility::post_load_show(self.lua(), wrapper);
+        // 10 · a Minimap's models, which its post-load override sets after chaining to this one
+        //      (`0x4ee2b0` calls `0x76a2f0` first).
+        self.apply_minimap(el, wrapper, dbg_name);
     }
 
     /// Apply one anchor, deferring it (when `may_defer`) while its named `relativeTo` is unbuilt.
@@ -888,42 +1063,32 @@ pub(super) fn abs_dim(el: &Element) -> (Option<f32>, Option<f32>) {
     (x, y)
 }
 
-/// Read an RGBA colour from a `<Color r= g= b= a=/>` element (`a` defaults to 1.0).
-pub(super) fn color_of(el: &Element) -> [f32; 4] {
-    let c = |k: &str, d: f32| {
+/// A `<Color r= g= b= a=/>` element as `0x6f23d0` packs it: each attribute that is present and
+/// non-empty through `SStrToFloat` (`0x64aaa0`, so text with no number is 0), else 0 for r, g and b
+/// and 1 for a (`0x6f23e2`-`0x6f23f7`), then clamped and rounded as every colour setter does.
+pub(super) fn color_of(el: &Element) -> crate::color::Rgba8 {
+    let c = |k: &str, d: f64| {
         el.attr(k)
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(d)
+            .filter(|v| !v.is_empty())
+            .map_or(d, crate::script::binding_abi::s_str_to_float)
     };
-    [c("r", 0.0), c("g", 0.0), c("b", 0.0), c("a", 1.0)]
+    crate::color::Rgba8::pack(c("r", 0.0), c("g", 0.0), c("b", 0.0), c("a", 1.0))
 }
 
-/// A `<TexCoords>` child's UV rect `(l, r, t, b)`; one missing an edge is ignored (full UVs).
-pub(super) fn tex_coords_of(el: &Element) -> Option<(f32, f32, f32, f32)> {
-    let tc = children_named(el, "TexCoords").next()?;
-    let edge = |k: &str| tc.attr(k).and_then(|v| v.trim().parse::<f32>().ok());
-    Some((edge("left")?, edge("right")?, edge("top")?, edge("bottom")?))
-}
-
-/// Whether an XML `<Texture>` loads its file with the wrap flag on: some `<TexCoords>` child has
-/// an edge below 0 or above 1 (`0x76fff0`-`0x77006b` set the flag at `0x770071`, which `0x77012d`
-/// passes to `0x770200`). An edge left out or empty keeps its default 0, 1, 0, 1 (`0x76fef5`),
-/// and a NaN fails both tests.
-pub(super) fn tex_coords_wrap(el: &Element) -> bool {
-    children_named(el, "TexCoords").any(|tc| {
-        [("left", 0.0), ("right", 1.0), ("top", 0.0), ("bottom", 1.0)]
-            .into_iter()
-            .any(|(k, default)| {
-                // Not `contains`: a NaN edge is in range here.
-                #[allow(clippy::manual_range_contains)]
-                let out_of_range = |edge: f32| edge < 0.0 || edge > 1.0;
-                let edge = tc
-                    .attr(k)
-                    .filter(|v| !v.is_empty())
-                    .map_or(default, crate::framexml::atof);
-                out_of_range(edge)
-            })
-    })
+/// A `<TexCoords>` element's edges `(l, r, t, b)`: each starts at 0, 1, 0, 1 and is read with
+/// `atof` only when present and non-empty (`0x76fef5`-`0x76ff70`).
+pub(super) fn tex_coords(tc: &Element) -> (f32, f32, f32, f32) {
+    let edge = |k: &str, default: f32| {
+        tc.attr(k)
+            .filter(|v| !v.is_empty())
+            .map_or(default, crate::framexml::atof)
+    };
+    (
+        edge("left", 0.0),
+        edge("right", 1.0),
+        edge("top", 0.0),
+        edge("bottom", 1.0),
+    )
 }
 
 /// A `<FontHeight>`-style scalar: its `<AbsValue val=>` child, else its own `val=`.
@@ -932,54 +1097,25 @@ pub(super) fn abs_value(el: &Element) -> Option<f32> {
     src.attr("val").and_then(|v| v.trim().parse::<f32>().ok())
 }
 
-/// A [`FontObject`] from a flattened `<Font>`. The merge appends inherited nodes first, so the last
-/// `<FontHeight>`, `<Color>` and `<Shadow>` win.
-pub(super) fn font_object_from_element(el: &Element) -> FontObject {
-    let justify_h = el
-        .attr("justifyH")
-        .map(|j| match j.to_ascii_uppercase().as_str() {
-            "LEFT" => JustifyH::Left,
-            "RIGHT" => JustifyH::Right,
-            _ => JustifyH::Center,
+/// A `<Shadow>` element (`0x7713ca`, `0x784058`): its first `<Color>` over opaque black
+/// (`0xff000000`), and its first `<Offset>`, else (0.001, -0.001) (`0x3a83126f`, `0xba83126f`).
+/// The offset reader zeroes both coordinates first (`0x6f1ebe`, `0x6f1ece`), so a coordinate an
+/// `<Offset>` leaves out is 0.
+pub(super) fn shadow_of(sh: &Element) -> crate::script::FontShadow {
+    let offset = children_named(sh, "Offset")
+        .next()
+        .map_or([0.001, -0.001], |o| {
+            let (x, y) = abs_dim(o);
+            [x.unwrap_or(0.0), y.unwrap_or(0.0)]
         });
-    let justify_v = el
-        .attr("justifyV")
-        .map(|j| match j.to_ascii_uppercase().as_str() {
-            "TOP" => JustifyV::Top,
-            "BOTTOM" => JustifyV::Bottom,
-            _ => JustifyV::Middle,
-        });
-    // `<Shadow>` inherits like any child: `MasterFont`'s (1,-1) black reaches every `GameFont*`
-    // (`Fonts.xml:55`).
-    let shadow = children_named(el, "Shadow").last().map(|sh| {
-        let offset = children_named(sh, "Offset")
-            .next()
-            .map(abs_dim)
-            .map(|(x, y)| [x.unwrap_or(0.0), y.unwrap_or(0.0)])
-            .unwrap_or([0.0, 0.0]);
-        let color = children_named(sh, "Color")
-            .next()
-            .map(color_of)
-            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
-        crate::script::FontShadow { offset, color }
-    });
-    FontObject {
-        font: el.attr("font").map(str::to_string),
-        height: children_named(el, "FontHeight").last().and_then(abs_value),
-        color: children_named(el, "Color").last().map(color_of),
-        outline: el.attr("outline").map(Outline::parse).unwrap_or_default(),
-        justify_h,
-        justify_v,
-        shadow,
-        // `spacing=` (`0x783ee0`, read with `atof` when not empty), inherited down the flattened
-        // chain like the other attributes.
-        spacing: el
-            .attr("spacing")
-            .filter(|v| !v.is_empty())
-            .map(crate::framexml::atof),
-    }
+    let color = children_named(sh, "Color")
+        .next()
+        .map_or(crate::color::Rgba8::BLACK, color_of);
+    crate::script::FontShadow { offset, color }
 }
 
+#[cfg(test)]
+mod level_tests;
 #[cfg(test)]
 mod template_name_tests;
 #[cfg(test)]

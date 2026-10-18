@@ -434,9 +434,10 @@ pub(crate) fn seat_text_measurer(script: &mut UiScript, atlas: &UiFontAtlas, sea
 pub(super) fn tick_script(
     script: Option<NonSendMut<UiScript>>,
     window: Query<&Window, With<PrimaryWindow>>,
-    // Real time: the reference's `GetTime` is the OS tick count, and virtual time clamps each
-    // delta to 250 ms, so a stall would leave every GetTime-anchored timer running long.
-    time: Res<Time<Real>>,
+    // The paced frame step, unclamped, as 1.12.1 hands `OnUpdate` its frame time (`0x76b2c0`):
+    // not `Time<Real>`, which pipelined rendering mis-splits, nor `Time<Virtual>`, which clamps a
+    // stall to 250 ms and which the capture harness pauses.
+    step: Res<benilla_world::frame_pace::FrameStep>,
     mut ui_clock: ResMut<super::UiClock>,
     mut font_atlas: Option<ResMut<UiFontAtlas>>,
     // The booth seam's DPI, and the pane map cleared when the VM or the window is gone.
@@ -536,13 +537,15 @@ pub(super) fn tick_script(
             if resized || rescaled {
                 super::manifest::on_screen_resized(&script);
             }
+        } else if resized && script.vm_kind() == benilla_ui::script::VmKind::Glue {
+            super::glue::on_glue_screen_resized(&script);
         }
-        script.tick(time.delta_secs());
+        script.tick(step.delta.as_secs_f32());
     }
-    // The VM's clock anchored at `Time<Real>`'s last update, whose deltas it accumulates; every
-    // `Instant` to `GetTime` conversion goes through this pair, never `Instant::now()`.
+    // The VM's clock anchored at the instant the paced clock stands at, which moves by the same
+    // steps; every `Instant` to `GetTime` conversion goes through this pair, never `Instant::now()`.
     *ui_clock = super::UiClock {
-        anchor: time.last_update().unwrap_or_else(std::time::Instant::now),
+        anchor: step.at,
         ui_now: script.now(),
     };
     let us_tick = lap();
@@ -585,7 +588,8 @@ pub(super) fn tick_script(
                             path: r.font.as_deref(),
                             height: crate::ui_text::drawn_px(r.height, None, s * r.scale),
                             outline: r.outline, // the outline biases the stepped width
-                            spacing: 0.0,       // the gap moves rows, never counts them
+                            monochrome: false,
+                            spacing: 0.0, // the gap moves rows, never counts them
                             // The drawn shadow seeds each row, as the draw's does.
                             shadow_x: r.shadow_x * s * r.scale,
                             alpha_gradient: None,
@@ -1219,12 +1223,32 @@ fn convert_entry(
                 });
                 return;
             }
+            // The model-unit ladder `0x76d1a0` derives, shared by a file's tile and a copy's
+            // booth.
+            let dpi = booths.tiles.dpi.max(0.01);
+            let aspect = if h > 0.0 { w / h } else { 4.0 / 3.0 };
+            let diag = (aspect * aspect + 1.0).sqrt();
+            let layout = eq.scale;
+            let units = crate::portrait::PaneUnits {
+                // 1 model unit is `1280 · modelScale · layoutScale` FrameXML units (`0x76d1a0`).
+                px_per_unit: 1280.0 * model_scale * layout * s * dpi,
+                // `SetPosition` is in layout units: `768 · √(a²+1)` FrameXML per unit.
+                pos_px_per_unit: 768.0 * diag * layout * s * dpi,
+                // A particle's half-extent: eye space, neither scale (`0x7b2a50`).
+                star_px_per_unit: 768.0 * diag * s * dpi,
+                position: Vec3::new(position.0, position.1, position.2),
+                // The perspective root, in model units: translate `pos · layoutScale`, rotate
+                // `facing`, scale `G48 · (5/3) · modelScale · layoutScale`, where `G48 · (5/3)` is
+                // the 4:3 renormalizer `√((4/3)²+1)/√(a²+1)` (`0x80655c`); the near and far planes
+                // do not scale with it.
+                root_scale: (5.0 / 3.0) / diag * model_scale * layout,
+                root_pos: Vec3::new(position.0, position.1, position.2) * layout,
+            };
             // A character pane publishes an idempotent request; `portrait::panes` builds the
             // pane's booth and draws its quad each frame the engine lists the pane with a copy.
             // Published with a file too: a `SetUnit` pending over it builds the copy that
             // replaces the file.
             if character && rect.width() > 0.0 && rect.height() > 0.0 {
-                let dpi = booths.tiles.dpi.max(0.01);
                 booths.character.insert(
                     handle,
                     crate::portrait::PaneRequest {
@@ -1237,6 +1261,7 @@ fn convert_entry(
                             (rect.width() * dpi).round().max(1.0) as u32,
                             (rect.height() * dpi).round().max(1.0) as u32,
                         ),
+                        units,
                     },
                 );
             }
@@ -1244,10 +1269,6 @@ fn convert_entry(
             // its quad each frame, so a cell packed later needs no re-conversion.
             if let Some(path) = model.as_deref() {
                 let tiles = &mut booths.tiles;
-                let dpi = tiles.dpi.max(0.01);
-                let aspect = if h > 0.0 { w / h } else { 4.0 / 3.0 };
-                let diag = (aspect * aspect + 1.0).sqrt();
-                let layout = eq.scale;
                 let size_px = UVec2::new(
                     (rect.width() * dpi).round().max(1.0) as u32,
                     (rect.height() * dpi).round().max(1.0) as u32,
@@ -1257,21 +1278,13 @@ fn convert_entry(
                     crate::ui_models::TileRequest {
                         path: path.to_string(),
                         size_px,
-                        // 1 model unit is `1280 · modelScale · layoutScale` FrameXML units
-                        // (`0x76d1a0`).
-                        px_per_unit: 1280.0 * model_scale * layout * s * dpi,
-                        // `SetPosition` is in layout units: `768 · √(a²+1)` FrameXML per unit.
-                        pos_px_per_unit: 768.0 * diag * layout * s * dpi,
-                        // A particle's half-extent: eye space, neither scale (`0x7b2a50`).
-                        star_px_per_unit: 768.0 * diag * s * dpi,
+                        px_per_unit: units.px_per_unit,
+                        pos_px_per_unit: units.pos_px_per_unit,
+                        star_px_per_unit: units.star_px_per_unit,
                         facing,
-                        position: Vec3::new(position.0, position.1, position.2),
-                        // The perspective root, in model units: translate `pos · layoutScale`,
-                        // rotate `facing`, scale `G48 · (5/3) · modelScale · layoutScale`, where
-                        // `G48 · (5/3)` is the 4:3 renormalizer `√((4/3)²+1)/√(a²+1)`
-                        // (`0x80655c`); the near and far planes do not scale with it.
-                        root_scale: (5.0 / 3.0) / diag * model_scale * layout,
-                        root_pos: Vec3::new(position.0, position.1, position.2) * layout,
+                        position: units.position,
+                        root_scale: units.root_scale,
+                        root_pos: units.root_pos,
                         camera,
                         light,
                         fog,
@@ -1304,7 +1317,7 @@ fn convert_entry(
             path,
             color,
             gradient,
-            additive,
+            blend,
             tex_coords,
             wrap,
             circular,
@@ -1435,7 +1448,7 @@ fn convert_entry(
                 uv_clamp,
                 color,
                 corner_colors,
-                additive,
+                blend,
                 clip,
                 // `SetRotation` is counter-clockwise-positive, `UiQuad::rotation` clockwise.
                 rotation: -rotation,
@@ -1487,6 +1500,7 @@ fn convert_entry(
             text_height,
             shadow,
             outline,
+            monochrome,
             spacing,
             alpha_gradient,
             world_seat,
@@ -1510,6 +1524,7 @@ fn convert_entry(
                     text_height,
                     shadow,
                     outline,
+                    monochrome,
                     spacing,
                     alpha_gradient,
                     world_seat,
@@ -1652,7 +1667,7 @@ mod cursor_quad_tests {
         assert_eq!(q.rect.height(), 32.0);
         assert_eq!(q.z_key, u128::MAX);
         assert!(q.texture.is_some());
-        assert!(!q.additive);
+        assert_eq!(q.blend, benilla_ui::script::BlendMode::Blend);
     }
 }
 
@@ -1702,6 +1717,7 @@ mod clip_plumb_tests {
         app.init_resource::<Time>();
         app.init_resource::<Time<Real>>();
         app.init_resource::<crate::ui_script::UiClock>();
+        app.init_resource::<benilla_world::frame_pace::FrameStep>();
         // The uiScale dial at 1.0, the identity.
         app.init_resource::<crate::ui_script::UiScaleCvar>();
         app.world_mut().spawn((
@@ -1788,6 +1804,7 @@ mod clip_plumb_tests {
         app.init_resource::<Time>();
         app.init_resource::<Time<Real>>();
         app.init_resource::<crate::ui_script::UiClock>();
+        app.init_resource::<benilla_world::frame_pace::FrameStep>();
         app.init_resource::<crate::ui_script::UiScaleCvar>();
         app.world_mut().spawn((
             Window {
@@ -1998,7 +2015,8 @@ mod extract_gate_tests {
             .iter()
             .find(|q| q.texture.is_none() && q.corner_colors.is_some())
             .expect("the fade draws, with its corners");
-        let (top, bottom) = ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.5]);
+        let half = benilla_ui::color::alpha_f32(benilla_ui::color::frame_alpha_byte(0.5));
+        let (top, bottom) = ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, half]);
         assert_eq!(fade.corner_colors, Some([top, top, bottom, bottom]));
     }
 
@@ -2019,6 +2037,7 @@ mod extract_gate_tests {
         app.init_resource::<Time>();
         app.init_resource::<Time<Real>>();
         app.init_resource::<crate::ui_script::UiClock>();
+        app.init_resource::<benilla_world::frame_pace::FrameStep>();
         app.init_resource::<crate::ui_script::UiScaleCvar>();
         app.world_mut().spawn((
             Window {

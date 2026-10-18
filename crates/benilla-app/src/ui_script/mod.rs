@@ -75,6 +75,11 @@ pub(crate) struct CapturePointerPinned(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct EguiPointerOver(pub(crate) bool);
 
+/// Whether a dev overlay's text field has the keyboard: the UI and the bindings get no keys, as
+/// when an EditBox has focus.
+#[derive(Resource, Default)]
+pub(crate) struct EguiKeyboard(pub(crate) bool);
+
 /// Whether the dev `I` inspector's world picking is armed; `player::control` and `target::click`
 /// read it every frame, so it lives here, and the default (disarmed) is the player's.
 #[derive(Resource, Default)]
@@ -187,7 +192,9 @@ pub(crate) struct UiInput;
 /// `Cooldown.lua:3` gates on `start > 0`, so a reset would hide every running cooldown's sweep.
 #[derive(Resource)]
 pub(crate) struct UiClock {
-    /// `Time<Real>::last_update()` at the tick that produced [`Self::ui_now`].
+    /// [`FrameStep::at`] at the tick that produced [`Self::ui_now`].
+    ///
+    /// [`FrameStep::at`]: benilla_world::frame_pace::FrameStep::at
     pub(crate) anchor: std::time::Instant,
     /// The VM clock after that tick, in seconds since this process started.
     pub(crate) ui_now: f64,
@@ -281,25 +288,30 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiSca
 
 /// `/console reloadUI` (`0x4035f0`): a glue rebuild asked for whatever the state
 /// ([`glue::run_pending_glue_rebuild`] spends it), then the same deferred rebuild `ReloadUI()` and
-/// `/reload` queue, which the world alone honours.
+/// `/reload` queue, which the world alone honours. It prints nothing in any state: the handler
+/// sets the flag `[0xb41d8c]` and calls `CGGameUI::Reload` (`0x491380`), neither of which writes
+/// a line, so a run with no interface to reload is silent too.
 fn console_reload_ui(world: &mut World, _args: &str) -> Vec<String> {
     if let Some(mut rebuild) = world.get_resource_mut::<glue::GlueRebuild>() {
         rebuild.request();
     }
-    match world.get_non_send_resource_mut::<UiScript>() {
-        Some(mut script) => {
-            script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi);
-            Vec::new()
-        }
-        None => vec!["reloadUI: no interface to reload".to_string()],
+    if let Some(mut script) = world.get_non_send_resource_mut::<UiScript>() {
+        script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi);
     }
+    Vec::new()
 }
 
 impl Plugin for UiScriptPlugin {
     fn build(&self, app: &mut App) {
         use crate::console::ConsoleCommandApp;
         app.add_observer(on_cvar);
-        app.console_command("reloadUI", "Reload the interface.", console_reload_ui);
+        // Category 1 with no help (`0x402ba6`-`0x402bb4`).
+        app.console_command(
+            "reloadUI",
+            crate::console::GRAPHICS,
+            None,
+            console_reload_ui,
+        );
         // The quit root runs in `Last`: the close button's `AppExit` is written in `PostUpdate`.
         crate::shutdown::on_app_exit(app, shutdown_on_exit.into_configs());
         app.insert_resource(UiScaleCvar(default_ui_scale()))
@@ -316,6 +328,7 @@ impl Plugin for UiScriptPlugin {
                     || std::env::var_os("WOW_CAPTURE_UI").is_some(),
             ))
             .init_resource::<EguiPointerOver>()
+            .init_resource::<EguiKeyboard>()
             .init_resource::<InspectMode>()
             .init_resource::<PlayerUiHover>()
             .init_resource::<UiKeyboardCapture>()
@@ -323,6 +336,7 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<PlayerUiPressConsumed>()
             .init_resource::<CursorPayloadHeld>()
             .init_resource::<UiClock>()
+            .init_resource::<benilla_world::frame_pace::FrameStep>()
             .init_resource::<AddOnIdentity>()
             // After `AssetSet::Open`: the VM's first load is the chain's `GlobalStrings.lua`.
             .add_systems(
@@ -489,17 +503,17 @@ pub(crate) use lifecycle::{
     finish_ui_load, is_emote_token_line, seat_from_roster, shutdown_ui_state,
 };
 
-/// `GetFramerate()`'s host half: FPS on `Time<Real>`, smoothed by a one-second pole; how the
-/// reference averages it is untraced.
+/// `GetFramerate()`'s host half: FPS on the frame step the UI ticks on, smoothed by a one-second
+/// pole; how the reference averages it is untraced.
 fn feed_framerate(
     script: Option<NonSendMut<UiScript>>,
-    time: Res<Time<bevy::time::Real>>,
+    step: Res<benilla_world::frame_pace::FrameStep>,
     mut smoothed: Local<f64>,
 ) {
     let Some(mut script) = script else {
         return;
     };
-    let dt = time.delta_secs_f64();
+    let dt = step.delta.as_secs_f64();
     if dt <= 0.0 {
         return; // the first frame, or a paused one
     }
@@ -808,6 +822,9 @@ mod dropdown_tests;
 
 #[cfg(test)]
 mod ui_scale_tests;
+
+#[cfg(test)]
+mod frame_step_tests;
 
 #[cfg(test)]
 mod action_bar_tests;

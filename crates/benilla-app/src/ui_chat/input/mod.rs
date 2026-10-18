@@ -4,6 +4,7 @@
 //! eligibility gate, the asleep gate, the stow, the posture, then `CMSG_TEXT_EMOTE`. Own sends are
 //! never echoed locally; the server echoes them.
 
+use crate::query_cache::Ask;
 use bevy::prelude::*;
 
 mod parse;
@@ -26,7 +27,10 @@ fn target_player_name(
     if !benilla_protocol::guid::is_player(guid) {
         return None;
     }
-    names.resolve_player(guid, commands).map(str::to_string)
+    // The command's lookup, as `UnitName`'s (`0x609210`) passes a callback.
+    names
+        .resolve_player(guid, Ask::Event(commands))
+        .map(str::to_string)
 }
 
 /// The target guid a `CMSG_TEXT_EMOTE` carries (`DoEmote`'s caller, `0x49fdb1`): the selection,
@@ -133,9 +137,9 @@ fn engine_verbs(
         out.push((String::new(), ParsedChat::Uninvite { name: Some(name) }));
     }
     for line in script.take_console_lines() {
-        // `ConsoleExec` already applied a valued CVar line; what reaches here is a console
-        // command (`detailDoodadAlpha`, registered by `0x63f9e0`, never persists) or a bare CVar
-        // name to print.
+        // `ConsoleExec` already ran the commands that write a CVar; what reaches here is a
+        // console command (`detailDoodadAlpha`, registered by `0x63f9e0`, never persists), a bare
+        // CVar name to print, or an unknown word.
         out.push((line.clone(), ParsedChat::Console { line }));
     }
     for cmd in script.take_channel_commands() {
@@ -877,19 +881,12 @@ pub(super) fn drain_chat_input(
             ParsedChat::Quit => {
                 script.queue_session_request(benilla_ui::script::SessionRequest::Quit)
             }
-            // Deferred to the world, since a command is `fn(&mut World, &str)`; its lines print
-            // as system text.
+            // Deferred to the world, since a command is `fn(&mut World, &str)`; its lines go to
+            // the log, never to chat ([`crate::console::run`]).
             ParsedChat::Console { line } => {
-                chat_out.console.queue(move |world: &mut World| {
-                    let lines = crate::console::execute(world, &line);
-                    let mut log = world.resource_mut::<super::feed::ChatLog>();
-                    for text in lines {
-                        log.push_event(super::event::ChatEvent::text_only(
-                            super::event::ChatEventKind::System,
-                            text,
-                        ));
-                    }
-                });
+                chat_out
+                    .console
+                    .queue(move |world: &mut World| crate::console::run(world, &line));
             }
             // The reference's handler body, run in the VM.
             ParsedChat::Lua { body } => {

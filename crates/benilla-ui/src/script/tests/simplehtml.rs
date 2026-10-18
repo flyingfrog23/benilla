@@ -719,8 +719,8 @@ fn the_hyperlink_format_shapes_the_a_splice() {
         .unwrap();
     assert_eq!(texts(&s, "Page"), ["see |cff33ff99|Hitem:1|h[this]|h|r"]);
 
-    // A non-string argument raises the reference's usage string.
-    assert!(s.run("Page:SetHyperlinkFormat(7)").is_err());
+    // A value `lua_isstring` refuses raises the reference's usage line (`0x796bcc`).
+    assert!(s.run("Page:SetHyperlinkFormat({})").is_err());
 }
 
 #[test]
@@ -739,13 +739,25 @@ fn the_paint_setters_land_on_the_element_and_reach_the_next_parse() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"H1\")")
             .unwrap(),
-        (1.0, 0.0, 0.0, 1.0)
+        (
+            crate::color::quant::read32(1.0),
+            0.0,
+            0.0,
+            crate::color::quant::read32(1.0)
+        )
     );
     // `P` keeps the font object's colour: the element argument scoped the write.
     let (r, g, b, _) = s
         .eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"P\")")
         .unwrap();
-    assert_eq!((r, g, b), (0.18, 0.12, 0.06));
+    assert_eq!(
+        (r, g, b),
+        (
+            crate::color::quant::read32(0.18),
+            crate::color::quant::read32(0.12),
+            crate::color::quant::read32(0.06)
+        )
+    );
     assert_eq!(
         s.eval::<(f32, f32)>("return Page:GetShadowOffset()")
             .unwrap(),
@@ -754,7 +766,7 @@ fn the_paint_setters_land_on_the_element_and_reach_the_next_parse() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return Page:GetShadowColor()")
             .unwrap(),
-        (0.0, 0.0, 0.0, 0.5)
+        (0.0, 0.0, 0.0, crate::color::quant::read32(0.5))
     );
 }
 
@@ -777,11 +789,16 @@ fn an_element_with_no_font_of_its_own_loses_its_own_colour_too() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"H1\")")
             .unwrap(),
-        (1.0, 0.0, 0.0, 1.0)
+        (
+            crate::color::quant::read32(1.0),
+            0.0,
+            0.0,
+            crate::color::quant::read32(1.0)
+        )
     );
     assert_eq!(
         block_color(&s, "Page", 0),
-        Some([0.18, 0.12, 0.06, 1.0]),
+        Some(crate::color::quant::drawn([0.18, 0.12, 0.06, 1.0])),
         "the block took elementFont[0] wholesale, so H1's red never reaches it"
     );
 
@@ -802,7 +819,11 @@ fn block_color(s: &UiScript, name: &str, i: usize) -> Option<[f32; 4]> {
     let model = lua.app_data_ref::<Model>().expect("model");
     let fh = model.arena.lookup(name).expect("frame");
     let st = model.simple_html.get(&fh).expect("state");
-    model.region_data.get(&st.blocks[i])?.vertex_color
+    model
+        .region_data
+        .get(&st.blocks[i])?
+        .vertex_color
+        .map(crate::color::Rgba8::to_f32)
 }
 
 /// `SetFontObject` on an element font: a re-point keeps what a local setter set (the inheritMask
@@ -830,7 +851,7 @@ fn set_font_object_keeps_local_overrides_and_the_nil_form_leaves_the_paint_stand
     assert_eq!(
         s.eval::<(f32, f32, f32)>("local r, g, b = H:GetTextColor(); return r, g, b")
             .unwrap(),
-        (0.0, 1.0, 0.0),
+        (0.0, crate::color::quant::read32(1.0), 0.0),
         "the colour was never set locally, so it re-reads from the new object"
     );
 
@@ -839,7 +860,7 @@ fn set_font_object_keeps_local_overrides_and_the_nil_form_leaves_the_paint_stand
     assert_eq!(
         s.eval::<(f32, f32, f32)>("local r, g, b = H:GetTextColor(); return r, g, b")
             .unwrap(),
-        (0.0, 1.0, 0.0),
+        (0.0, crate::color::quant::read32(1.0), 0.0),
         "severing the link leaves the resolved paint standing, it does not blank the element"
     );
 }
@@ -918,6 +939,27 @@ fn page_texts_on_screen(s: &UiScript) -> Vec<String> {
 }
 
 /// A Rust string as a Lua long-bracket literal, so quotes and backslashes need no second escape.
+/// The client's `[[` has no `=` levels, so the text must hold no bracket pair of its own.
 fn lua_str(s: &str) -> String {
-    format!("[==[{s}]==]")
+    assert!(
+        !s.contains("[[") && !s.contains("]]") && !s.starts_with('\n'),
+        "{s:?}"
+    );
+    format!("[[{s}]]")
+}
+
+/// `SetText` hands `lua_tostring(2)` to the parse (`0x796b1e`), which converts a number in place
+/// with `%.14g` (`0x6f7ca6`, `0x871960`): no f32 rounding, MSVC's three-digit exponent.
+#[test]
+fn a_number_parses_as_lua_number_text() {
+    let s = script();
+    page(&s);
+    for (code, want) in [
+        ("1/3", "0.33333333333333"),
+        ("123456789", "123456789"),
+        ("1e20", "1e+020"),
+    ] {
+        s.run(&format!("Page:SetText({code})")).unwrap();
+        assert_eq!(texts(&s, "Page"), [want], "{code}");
+    }
 }

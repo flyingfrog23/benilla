@@ -8,11 +8,13 @@ mod anchor_slots;
 mod anchors;
 mod backdrop;
 mod button;
+mod button_fonts;
 mod capture;
 mod channel;
 mod chat_bubble;
 mod clear_points;
 mod colour_args;
+mod colour_bytes;
 pub(in crate::script) mod common;
 mod cooldown;
 mod create_frame_template;
@@ -26,8 +28,10 @@ mod engine_updates;
 mod european_text;
 mod events;
 mod flag_args;
+mod font_links;
 mod font_object;
 mod frame_api;
+mod frame_state;
 mod generic_for;
 mod glue_surface;
 mod gm_ticket;
@@ -53,9 +57,11 @@ mod movable;
 mod name_targets;
 mod nameplate;
 mod no_font;
+mod number_text;
 mod numeric_shape_gate;
 mod object_model;
 mod one_or_nil_methods;
+mod open_layout;
 mod protected_gate;
 mod reference_surface;
 mod region_map;
@@ -79,10 +85,12 @@ mod texture_art;
 mod tooltip;
 mod tooltip_item;
 mod tooltip_setter_flags;
+mod tooltip_size;
 mod tooltip_spell;
 mod tooltip_unit;
 mod toplevel;
 mod update_walk;
+mod usage_lines;
 mod visibility;
 mod wheel;
 mod widget_args;
@@ -120,6 +128,21 @@ fn an_instruction_budget_turns_a_runaway_loop_into_an_error() {
     t.run("BudgetOk = 0 for i = 1, 1000 do BudgetOk = BudgetOk + i end")
         .unwrap();
     assert_eq!(t.eval::<i64>("return BudgetOk").unwrap(), 500_500);
+}
+
+/// The budget's raise reaches the host past every `pcall` and `xpcall`, and runs no handler: a
+/// loop under a protected call is stopped too.
+#[test]
+fn an_instruction_budget_is_caught_by_no_protected_call() {
+    for src in [
+        "while true do pcall(function() while true do end end) end",
+        "xpcall(function() while true do end end, function() while true do end end)",
+    ] {
+        let s = crate::script::UiScript::new().unwrap();
+        s.set_instruction_budget(5_000_000);
+        let err = s.run(src).expect_err(src).to_string();
+        assert!(err.contains("instruction budget exhausted"), "{src}: {err}");
+    }
 }
 
 /// The budget counts Lua that a library function calls, as 5.1's count hook does: a `gsub`

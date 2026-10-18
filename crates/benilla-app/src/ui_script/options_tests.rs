@@ -235,11 +235,15 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
                 QuadContent::Texture {
                     path: Some(p),
                     color,
-                    additive,
+                    blend,
                     ..
-                } if p.contains("UI-QuestLogTitleHighlight") => {
-                    q.rect.map(|r| (r, color.unwrap_or([1.0; 4]), *additive))
-                }
+                } if p.contains("UI-QuestLogTitleHighlight") => q.rect.map(|r| {
+                    (
+                        r,
+                        color.unwrap_or([1.0; 4]),
+                        *blend == benilla_ui::script::BlendMode::Add,
+                    )
+                }),
                 _ => None,
             })
             .collect()
@@ -387,6 +391,11 @@ fn search_reflows_live_rows_and_restores_the_page() {
     let authored_top: f32 = s
         .eval("return BenillaOptionsFrameContainerBodyAudioRowMaster:GetTop()")
         .unwrap();
+    // The clear button's icon rests at half alpha, set by its `OnLoad`: no region reads `alpha=`.
+    let icon: f32 = s
+        .eval("return BenillaOptionsFrameSearchBoxClearButtonIcon:GetAlpha()")
+        .unwrap();
+    assert!((icon - 0.5).abs() < 0.01, "the clear icon at rest: {icon}");
 
     s.run("BenillaOptionsFrameSearchBox:SetText(\"music\")")
         .unwrap();
@@ -1893,7 +1902,13 @@ fn defaults_resets_the_controls_page_to_registered_defaults() {
         changes.contains(&("autoLootDefault".to_string(), "0".to_string())),
         "{changes:?}"
     );
-    assert_eq!(changes.len(), 2, "only the moved values queue: {changes:?}");
+    // The Mouse Look Speed row's pitch twin is written as the stock save writes it,
+    // `sliderValue/2` as a number (`UIOptionsFrame.lua:355-356`): "90" over the registered "90.0".
+    assert!(
+        changes.contains(&("cameraPitchMoveSpeed".to_string(), "90".to_string())),
+        "{changes:?}"
+    );
+    assert_eq!(changes.len(), 3, "only the moved values queue: {changes:?}");
     assert!(
         !s.eval::<bool>(
             "return BenillaOptionsFrameContainerBodyControlsRowStickyTargetCheck:GetChecked()"
@@ -3739,7 +3754,7 @@ fn the_max_camera_distance_slider_stores_a_factor_and_reads_out_yards() {
     assert_eq!(
         s.eval::<String>("return GetCVar(\"cameraDistanceMaxFactor\")")
             .unwrap(),
-        "1"
+        "1.0"
     );
     assert_eq!(
         s.eval::<String>(

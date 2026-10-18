@@ -87,6 +87,7 @@ impl Plugin for NetPlugin {
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
             .init_resource::<AddonInfoReply>()
+            .init_resource::<SessionBilling>()
             .init_resource::<PendingTransfer>()
             .init_resource::<NetStatus>()
             .init_resource::<DroppedOpcodes>()
@@ -363,7 +364,7 @@ pub(crate) struct ActiveMover;
 pub(crate) struct NetEvents(Receiver<SessionEvent>);
 
 /// The outbound command channel.
-#[derive(Resource)]
+#[derive(Resource, Debug)]
 pub(crate) struct NetCommands(pub(crate) Sender<ClientCommand>);
 
 /// The character-select channel to the IO thread parked at select: create and delete are served
@@ -633,15 +634,32 @@ pub(crate) struct WallClockSample {
     /// The server's `time(nullptr)` at `received`.
     base_unix: u32,
     received: Instant,
+    /// The responses of the session so far, this one included.
+    count: u64,
+    /// Whether the local clock read the server's second exactly, where the reference's offset
+    /// `G = local - server` would be 0 and is stored as 1 (`0x4def00`, `0x4def02`).
+    zero_offset: bool,
 }
 
 impl ServerWallClock {
     /// Take a fresh sample; it reads about RTT/2 behind, below a countdown's one-second grain.
-    pub(crate) fn sample(&mut self, unix_time: u32) {
+    pub(crate) fn sample(&mut self, unix_time: u32, local_unix: i64) {
         self.0 = Some(WallClockSample {
             base_unix: unix_time,
             received: Instant::now(),
+            count: self.samples() + 1,
+            zero_offset: local_unix == i64::from(unix_time),
         });
+    }
+
+    /// Whether the last sample found the local clock on the server's second (`0x4def02`).
+    pub(crate) fn zero_offset(&self) -> bool {
+        self.0.is_some_and(|s| s.zero_offset)
+    }
+
+    /// The responses sampled so far.
+    pub(crate) fn samples(&self) -> u64 {
+        self.0.map_or(0, |s| s.count)
     }
 
     /// Server unix seconds now, fractional.
@@ -2211,8 +2229,6 @@ pub(crate) struct CharacterLoginFailedMessage {
 /// We entered the world.
 #[derive(Message)]
 pub(crate) struct EnteredWorldMessage {
-    /// Rested billing minutes from `SMSG_AUTH_RESPONSE`, the only time they arrive.
-    pub(crate) billing_time_rested: u32,
     /// The tutorial flags, if `SMSG_TUTORIAL_FLAGS` came during the login handshake.
     pub(crate) tutorial_flags: Option<Vec<u8>>,
 }
@@ -2228,6 +2244,12 @@ pub(crate) struct WorldEnterCascadeMessage;
 /// rewritten on every login from the reply its link got.
 #[derive(Resource, Default)]
 pub(crate) struct AddonInfoReply(pub(crate) Option<Vec<benilla_protocol::messages::AddonRecord>>);
+
+/// The connection's billing group, from its authentication alone (`0x5b41b0`); a resource for the
+/// same reason as [`AddonInfoReply`], rewritten at every login. The in-game `GetBillingTimeRested`
+/// and [`crate::ui_billing`]'s warning read it.
+#[derive(Resource, Default, Clone, Copy)]
+pub(crate) struct SessionBilling(pub(crate) benilla_protocol::messages::Billing);
 
 /// `SMSG_TRIGGER_CINEMATIC`: a `CinematicSequences.dbc` id; [`crate::cinematic`] plays and acks it.
 #[derive(Message)]
@@ -2289,13 +2311,11 @@ impl DisconnectedMessage {
 }
 
 /// A login attempt failed before the roster; the IO thread is back at its pre-logon park.
-/// `terminal` is a failure retrying cannot fix (the server requires Warden, say): never resubmit.
 #[derive(Message, Clone)]
 pub(crate) struct LoginFailedMessage {
     /// Which server refused us, with which byte; `None` on a transport failure.
     pub(crate) refusal: Option<benilla_protocol::LoginRefusal>,
     pub(crate) reason: String,
-    pub(crate) terminal: bool,
 }
 
 /// A same-map teleport of our player: snap, then ack. Read by the controller in `Input`.

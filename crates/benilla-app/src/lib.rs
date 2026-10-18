@@ -50,6 +50,8 @@ mod debug_panel;
 /// The dev/player seam: the instrument groups and the boundary rule. Always compiled; what it holds
 /// is not.
 mod dev;
+#[cfg(feature = "dev")]
+mod devtools;
 mod doodad_events;
 mod entities;
 mod field_watch;
@@ -109,7 +111,6 @@ mod target;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod text_filter;
-mod text_reshape;
 mod textinput;
 mod transport;
 mod tutorial;
@@ -120,6 +121,7 @@ mod ui_bank;
 mod ui_battlefield;
 mod ui_battlefield_positions;
 mod ui_battlefield_score;
+mod ui_billing;
 mod ui_bind_confirm;
 mod ui_binder;
 mod ui_cast;
@@ -145,6 +147,7 @@ mod ui_loot;
 mod ui_loot_roll;
 mod ui_macro;
 mod ui_mail;
+mod ui_memory;
 mod ui_merchant;
 mod ui_mirror;
 mod ui_models;

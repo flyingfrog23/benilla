@@ -37,11 +37,10 @@ fn open(which: &'static str, key: Option<&'static str>) -> Outgoing {
     }
 }
 
-fn failed(refusal: Option<LoginRefusal>, terminal: bool) -> LoginFailedMessage {
+fn failed(refusal: Option<LoginRefusal>) -> LoginFailedMessage {
     LoginFailedMessage {
         refusal,
         reason: "test".into(),
-        terminal,
     }
 }
 
@@ -91,7 +90,7 @@ fn a_proof_0x0a_changes_no_dialog() {
     m.tick();
     settle(&mut m);
     m.outbox.clear();
-    m.on_failed(&failed(Some(LoginRefusal::LogonProof(0x0a)), false));
+    m.on_failed(&failed(Some(LoginRefusal::LogonProof(0x0a))));
     m.tick();
     settle(&mut m);
     assert!(m.outbox.is_empty(), "{:?}", m.outbox);
@@ -181,7 +180,7 @@ fn a_logon_refusal_opens_its_result_and_ends_the_logon() {
         m.login("a".into(), "b".into());
         settle(&mut m);
         m.outbox.clear();
-        m.on_failed(&failed(refusal, false));
+        m.on_failed(&failed(refusal));
         m.tick();
         settle(&mut m);
         assert_eq!(m.outbox, [open(which, Some(key))], "{refusal:?}");
@@ -305,7 +304,7 @@ fn a_world_refusal_opens_its_status_and_url() {
         button: None,
     };
     let mut m = connected();
-    m.on_failed(&failed(Some(LoginRefusal::World(0x1c)), false));
+    m.on_failed(&failed(Some(LoginRefusal::World(0x1c))));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -325,7 +324,7 @@ fn a_world_refusal_opens_its_status_and_url() {
     assert_eq!(m.state, ScreenState::Idle);
 
     let mut m = connected();
-    m.on_failed(&failed(Some(LoginRefusal::World(0x0d)), false));
+    m.on_failed(&failed(Some(LoginRefusal::World(0x0d))));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -341,7 +340,7 @@ fn a_world_refusal_opens_its_status_and_url() {
     );
 
     let mut m = connected();
-    m.on_failed(&failed(None, false));
+    m.on_failed(&failed(None));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -362,7 +361,7 @@ fn a_world_refusal_opens_its_status_and_url() {
     // With no realm held the arm asks for the list (`0x46c06e` → `0x46b8d0` with 1).
     let mut m = connected();
     m.holder.clear();
-    m.on_failed(&failed(None, false));
+    m.on_failed(&failed(None));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -613,39 +612,6 @@ fn a_late_roster_reply_is_dropped_unless_it_lands_before_the_tick() {
     assert!(m.op.done && m.op.ok);
 }
 
-/// A server that wants Warden refuses the roster ask with its words (a terminal login failure):
-/// the query completes failed and the next tick opens `OKAY` with them (`0x46c173`), where state 3
-/// would otherwise stand on its `CANCEL` dialog for ever. The link is gone.
-#[test]
-fn a_terminal_failure_fails_the_character_list_query_with_its_words() {
-    let mut m = fresh();
-    m.connected = true;
-    m.get_character_list();
-    settle(&mut m);
-    m.park_out.clear();
-    m.outbox.clear();
-    m.on_failed(&failed(None, true));
-    m.tick();
-    settle(&mut m);
-    let words = || Text::Raw("test".into());
-    assert_eq!(
-        m.outbox,
-        [
-            Outgoing::Update {
-                text: words(),
-                button: None,
-            },
-            Outgoing::Open {
-                which: "OKAY",
-                text: Some(words()),
-                data: None,
-            },
-        ]
-    );
-    assert_eq!(m.state, ScreenState::Idle);
-    assert!(!m.connected);
-}
-
 /// A roster ask that failed on the stream completes the query `CHAR_LIST_FAILED`
 /// (`0x5ab300`'s failure leg), which the tick opens as `OKAY`, instead of leaving the retrieving
 /// dialog up; one of another link changes nothing.
@@ -830,11 +796,11 @@ fn the_queue_estimate_stands_between_packets_and_a_connect_clears_it() {
             other => other.to_string(),
         })
     };
-    assert_eq!(shown(&m, last), "Realm 93 15");
-    assert_eq!(shown(&m, last + 300_000), "Realm 93 10");
+    assert_eq!(shown(&m, last), "\nRealm 93 15", "after the blank line");
+    assert_eq!(shown(&m, last + 300_000), "\nRealm 93 10");
     assert_eq!(
         shown(&m, last + 1_000_000),
-        "QUEUE_NAME_TIME_LEFT_SECONDS",
+        "\nQUEUE_NAME_TIME_LEFT_SECONDS",
         "past zero"
     );
     m.begin_connect();
@@ -1366,7 +1332,7 @@ fn a_world_status_past_the_table_reads_its_number() {
         let mut m = fresh();
         m.state = ScreenState::Connect;
         m.holder = vec![realm("Fake")];
-        m.on_failed(&failed(Some(LoginRefusal::World(code)), false));
+        m.on_failed(&failed(Some(LoginRefusal::World(code))));
         m.tick();
         settle(&mut m);
         m.outbox
@@ -1944,7 +1910,7 @@ fn a_failed_logons_dialog_is_pressed_in_state_1() {
         m.settle();
         m.outbox.clear();
         m.login_out.clear();
-        m.on_failed(&failed(Some(LoginRefusal::Logon(0x04)), false));
+        m.on_failed(&failed(Some(LoginRefusal::Logon(0x04))));
     }
     frame(&shared, &mut s);
     let m = shared.get();
@@ -2230,7 +2196,7 @@ fn the_stock_login_reaches_the_login_engine_and_shows_its_status() {
     assert_eq!(dialog(&app), Some(("CANCEL".into(), connecting)));
 
     app.world_mut()
-        .write_message(failed(Some(LoginRefusal::Logon(0x04)), false));
+        .write_message(failed(Some(LoginRefusal::Logon(0x04))));
     app.update();
     let unknown = vm(&app).global_text("LOGIN_UNKNOWN_ACCOUNT");
     assert!(!unknown.is_empty());
@@ -2433,16 +2399,9 @@ fn pump(
                 lists.write(RealmListMessage { realms, failed });
             }
             E::LoginFailed {
-                refusal,
-                reason,
-                terminal,
-                ..
+                refusal, reason, ..
             } => {
-                failures.write(LoginFailedMessage {
-                    refusal,
-                    reason,
-                    terminal,
-                });
+                failures.write(LoginFailedMessage { refusal, reason });
             }
             E::CharacterList {
                 characters,
@@ -2489,15 +2448,10 @@ fn pump(
                     .renames
                     .write(crate::net::CharRenameMessage { result, renamed });
             }
-            E::Connected {
-                billing_time_rested,
-                tutorial_flags,
-                ..
-            } => {
-                char_writes.entered.write(crate::net::EnteredWorldMessage {
-                    billing_time_rested,
-                    tutorial_flags,
-                });
+            E::Connected { tutorial_flags, .. } => {
+                char_writes
+                    .entered
+                    .write(crate::net::EnteredWorldMessage { tutorial_flags });
             }
             E::CharacterLoginFailed { result } => {
                 char_writes
@@ -3116,6 +3070,13 @@ fn preview(app: &App) -> &crate::portrait::GluePreview {
     app.world().resource::<crate::portrait::GluePreview>()
 }
 
+/// The stock scene file `GlueParent.lua`'s `SetBackgroundModel` names, `UI_<name>`.
+fn stock_scene(name: &str) -> crate::portrait::GlueSceneFile {
+    crate::portrait::GlueSceneFile::new(&format!(
+        "Interface\\Glues\\Models\\UI_{name}\\UI_{name}.mdx"
+    ))
+}
+
 /// The stock login's `AccountLogin` pane drives the glue booth: `UI_MainMenu` under the pane's
 /// own fog, `AccountLogin.xml`'s `<FogColor>` and `fogFar`, with nobody standing in it.
 #[test]
@@ -3123,7 +3084,7 @@ fn the_stock_login_stands_the_main_menu_in_the_glue_booth() {
     let _ = benilla_formats::wow_data_or_skip!();
     let (app, _rx, _abandon) = stock_app();
     let p = preview(&app);
-    assert_eq!(p.scene, Some(crate::portrait::GlueScene::MainMenu));
+    assert_eq!(p.scene, Some(stock_scene("MainMenu")));
     assert!(p.look.is_none());
     let fog = p.fog.expect("the main menu fogs");
     assert_eq!((fog.near, fog.far), (0.0, 1200.0));
@@ -3137,7 +3098,7 @@ fn the_stock_login_stands_the_main_menu_in_the_glue_booth() {
 /// facing cell `SetCharacterSelectFacing` writes, and the next select squares it.
 #[test]
 fn the_stock_select_stands_the_selected_character_at_the_cells_facing() {
-    use crate::portrait::{GlueLook, GlueScene, SelectLook};
+    use crate::portrait::{GlueLook, SelectLook};
     let _ = benilla_formats::wow_data_or_skip!();
     let mut roster = roster3();
     let mut dwarf = crate::glue_session::roster::test_character(0x14, "Delta");
@@ -3153,14 +3114,17 @@ fn the_stock_select_stands_the_selected_character_at_the_cells_facing() {
         p.look == Some(GlueLook::Select(SelectLook::from(&roster[1]))),
         "lastCharacterIndex 1 stands Bravo"
     );
-    assert_eq!((p.scene, p.fog), (Some(GlueScene::Human), None));
+    assert_eq!((p.scene.clone(), p.fog), (Some(stock_scene("Human")), None));
     assert_eq!(p.yaw, 0.0);
 
     vm(&app).run("CharacterSelect_SelectCharacter(1)").unwrap();
     app.update();
     let p = preview(&app);
     assert!(p.look == Some(GlueLook::Select(SelectLook::from(&roster[0]))));
-    assert_eq!((p.scene, p.fog), (Some(GlueScene::NightElf), None));
+    assert_eq!(
+        (p.scene.clone(), p.fog),
+        (Some(stock_scene("NightElf")), None)
+    );
 
     vm(&app).run("SetCharacterSelectFacing(90)").unwrap();
     app.update();
@@ -3172,7 +3136,7 @@ fn the_stock_select_stands_the_selected_character_at_the_cells_facing() {
     assert_eq!(p.yaw, 0.0, "every select zeroes the facing (`0x472a61`)");
     assert_eq!(
         p.scene,
-        Some(GlueScene::Dwarf),
+        Some(stock_scene("Dwarf")),
         "a gnome stands in Dwarf's stage"
     );
     // The dwarf after the gnome: the same stage, set again by its own file string, is a new
@@ -3181,7 +3145,7 @@ fn the_stock_select_stands_the_selected_character_at_the_cells_facing() {
     vm(&app).run("CharacterSelect_SelectCharacter(4)").unwrap();
     app.update();
     let p = preview(&app);
-    assert_eq!(p.scene, Some(GlueScene::Dwarf));
+    assert_eq!(p.scene, Some(stock_scene("Dwarf")));
     assert_ne!(p.stage, gnome_stage);
     // The pane is GlueParent's, the whole 4:3 screen.
     assert_eq!(p.pane, Some([0.0, 1.0, 0.0, 1.0]));
@@ -3193,7 +3157,6 @@ fn the_stock_select_stands_the_selected_character_at_the_cells_facing() {
 /// empties: an empty roster sets no background.
 #[test]
 fn the_stock_select_fogs_the_empty_roster_and_keeps_the_last_stage() {
-    use crate::portrait::GlueScene;
     let _ = benilla_formats::wow_data_or_skip!();
     let (mut app, _realmd, _world) = char_select_app(&[], "0", true);
     until(&mut app, "the roster load", |app| {
@@ -3201,7 +3164,7 @@ fn the_stock_select_fogs_the_empty_roster_and_keeps_the_last_stage() {
     });
     app.update();
     let p = preview(&app);
-    assert_eq!(p.scene, Some(GlueScene::Orc));
+    assert_eq!(p.scene, Some(stock_scene("Orc")));
     assert!(p.look.is_none());
     let fog = p.fog.expect("the empty roster's scene is fogged");
     assert_eq!((fog.near, fog.far), (0.0, 270.0));
@@ -3214,7 +3177,10 @@ fn the_stock_select_fogs_the_empty_roster_and_keeps_the_last_stage() {
     });
     app.update();
     let p = preview(&app);
-    assert_eq!((p.scene, p.fog), (Some(GlueScene::Tauren), None));
+    assert_eq!(
+        (p.scene.clone(), p.fog),
+        (Some(stock_scene("Tauren")), None)
+    );
     assert!(p.look.is_some());
 
     world.set_roster(&[]);
@@ -3225,7 +3191,10 @@ fn the_stock_select_fogs_the_empty_roster_and_keeps_the_last_stage() {
     });
     app.update();
     let p = preview(&app);
-    assert_eq!((p.scene, p.fog), (Some(GlueScene::Tauren), None));
+    assert_eq!(
+        (p.scene.clone(), p.fog),
+        (Some(stock_scene("Tauren")), None)
+    );
     assert!(p.look.is_none(), "the records are freed and detached");
     assert_eq!(vm(&app).errors(), Vec::<String>::new());
 }
@@ -4650,7 +4619,7 @@ fn create_look(app: &App) -> benilla_ui::script::GlueCreateLook {
 /// up, which asks for the list again and selects the new last row (`SELECT_LAST_CHARACTER`).
 #[test]
 fn the_stock_create_makes_the_character_and_selects_it() {
-    use crate::portrait::{CreateLook, GlueLook, GlueScene};
+    use crate::portrait::{CreateLook, GlueLook};
     let _ = benilla_formats::wow_data_or_skip!();
     let (mut app, _realmd, world) = create_screen();
     assert!(shown(&app, "CharacterCreate") && !shown(&app, "CharacterSelect"));
@@ -4683,7 +4652,7 @@ fn the_stock_create_makes_the_character_and_selects_it() {
                 facial_hair: 0,
             }))
     );
-    assert_eq!(p.scene, Some(GlueScene::Human));
+    assert_eq!(p.scene, Some(stock_scene("Human")));
     assert!((p.yaw + 15f32.to_radians()).abs() < 1e-5, "{}", p.yaw);
 
     // Orc (the list's fifth), female, Hunter (the Orc list's second), one skin colour on.
@@ -4728,7 +4697,7 @@ fn the_stock_create_makes_the_character_and_selects_it() {
                 facial_hair: cycled.facial_hair,
             }))
     );
-    assert_eq!(p.scene, Some(GlueScene::Orc));
+    assert_eq!(p.scene, Some(stock_scene("Orc")));
     let fog = p.fog.expect("the create scene keeps its fog");
     assert_eq!((fog.near, fog.far), (0.0, 270.0));
 

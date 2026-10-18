@@ -59,7 +59,7 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::Pong, on_pong);
 }
 
-/// The edges the bridge publishes as messages, and the two resources they park in.
+/// The edges the bridge publishes as messages, and the three resources they park in.
 #[derive(SystemParam)]
 pub(crate) struct Edges<'w> {
     teleports: MessageWriter<'w, TeleportMessage>,
@@ -71,6 +71,7 @@ pub(crate) struct Edges<'w> {
     char_login_failures: MessageWriter<'w, CharacterLoginFailedMessage>,
     entered_world: MessageWriter<'w, EnteredWorldMessage>,
     addon_reply: ResMut<'w, super::AddonInfoReply>,
+    billing: ResMut<'w, super::SessionBilling>,
     logged_out: MessageWriter<'w, LoggedOutMessage>,
     knockbacks: MessageWriter<'w, KnockBackMessage>,
     login_stages: MessageWriter<'w, LoginStageMessage>,
@@ -132,11 +133,8 @@ fn on_login_edge(In(ev): In<SessionEvent>, mut e: Edges) {
             e.login_queued.write(LoginQueuedMessage { position, realm });
         }
         SessionEvent::LoginFailed {
-            refusal,
-            reason,
-            terminal,
-            ..
-        } => login_failed(refusal, reason, terminal, &mut e.login_failures),
+            refusal, reason, ..
+        } => login_failed(refusal, reason, &mut e.login_failures),
         SessionEvent::RealmList { realms, failed } => {
             e.realm_lists.write(RealmListMessage { realms, failed });
         }
@@ -181,15 +179,15 @@ fn on_connected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
     if let SessionEvent::Connected {
         self_guid: guid,
         name,
-        billing_time_rested,
+        billing,
         tutorial_flags,
         addon_info,
     } = ev
     {
+        e.billing.0 = billing;
         connected(
             guid,
             name,
-            billing_time_rested,
             tutorial_flags,
             addon_info,
             &mut e.addon_reply,
@@ -383,6 +381,7 @@ fn on_reputation_delta(
     factions: Option<Res<crate::target::ring::Factions>>,
     mut chat_log: ResMut<crate::ui_chat::ChatLog>,
     mut quest: ResMut<QuestGiver>,
+    quest_log: Option<ResMut<crate::ui_quest_log::QuestLog>>,
 ) {
     if let SessionEvent::ReputationDelta { standings } = ev {
         crate::combat_log::chat::faction_standing(
@@ -392,6 +391,16 @@ fn on_reputation_delta(
             &mut chat_log,
         );
         if let (Some(f), Some(me)) = (factions.as_deref(), self_facts(&b)) {
+            let moved = crate::ui_reputation::rank_moved(
+                &standings,
+                &b.reputations,
+                f.catalog(),
+                me.race,
+                me.class,
+            );
+            if let (true, Some(mut quest_log)) = (moved, quest_log) {
+                quest_log.note_faction_rank_move();
+            }
             let lines = crate::ui_reputation::delta_lines(
                 &standings,
                 &b.reputations,
@@ -453,14 +462,9 @@ fn login_stage(stage: benilla_protocol::LoginStage, out: &mut MessageWriter<Logi
 fn login_failed(
     refusal: Option<benilla_protocol::LoginRefusal>,
     reason: String,
-    terminal: bool,
     out: &mut MessageWriter<LoginFailedMessage>,
 ) {
-    out.write(LoginFailedMessage {
-        refusal,
-        reason,
-        terminal,
-    });
+    out.write(LoginFailedMessage { refusal, reason });
 }
 
 /// `SMSG_CHAR_CREATE`/`SMSG_CHAR_DELETE`: the glue screen turns the code into its string.
@@ -517,7 +521,6 @@ fn cinematic_triggered(
 fn connected(
     guid: u64,
     name: String,
-    billing_time_rested: u32,
     tutorial_flags: Option<Vec<u8>>,
     addon_info: Option<Vec<benilla_protocol::messages::AddonRecord>>,
     addon_reply: &mut crate::net::AddonInfoReply,
@@ -538,10 +541,7 @@ fn connected(
     // Set before the world-entry UI load reads it, and every login, so a silent server inherits
     // no earlier answer.
     addon_reply.0 = addon_info;
-    entered_world.write(EnteredWorldMessage {
-        billing_time_rested,
-        tutorial_flags,
-    });
+    entered_world.write(EnteredWorldMessage { tutorial_flags });
 }
 
 /// `SMSG_LOGOUT_COMPLETE`: back to character select.
@@ -732,17 +732,18 @@ fn time_speed(
 /// `SMSG_QUERY_TIME_RESPONSE`: the server wall clock that absolute descriptor stamps (the
 /// timed-quest timer) are dated in; its skew against ours is logged once per session.
 fn server_unix_time(unix_time: u32, clock: &mut ServerWallClock) {
+    // `time(NULL)` at the sync (`0x4deef3`), whose difference is the reference's offset.
+    let local = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     if clock.0.is_none() {
-        let local = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         info!(
             "net: server wall clock {unix_time} (local clock differs by {}s)",
             local - i64::from(unix_time)
         );
     }
-    clock.sample(unix_time);
+    clock.sample(unix_time, local);
 }
 
 /// `SMSG_INITIALIZE_FACTIONS`: the login reputation store.

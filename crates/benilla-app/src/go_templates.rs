@@ -75,7 +75,7 @@ pub(crate) struct TextPage {
     pub(crate) material: u32,
 }
 
-/// Entry to template, asked once per connection.
+/// Entry to template, asked once while in flight.
 #[derive(Resource, Default)]
 pub(crate) struct GameObjectTemplates {
     templates: QueryCache<u32, GoTemplate>,
@@ -95,22 +95,41 @@ impl GameObjectTemplates {
         fields.object_entry().filter(|&e| e != 0)
     }
 
-    /// Asks for an object's template once per entry; every spawn of a template shares the one
-    /// query. The creation hook asks with the descriptor's entry and the guid (`0x5f7c40`,
-    /// `0x5f7d81`).
-    pub(crate) fn request(&self, guid: u64, fields: &ObjectFields, commands: &NetCommands) {
-        let Some(entry) = Self::key(fields) else {
-            return;
-        };
-        self.templates.get_or_ask(entry, || {
-            debug!("go: asking template (entry {entry}, guid {guid:#x})");
-            let _ = commands
-                .0
-                .send(ClientCommand::GameObjectQuery { entry, guid });
-        });
+    /// The creation hook's ask: it looks the template up with a callback, by the descriptor's
+    /// entry and the guid (`0x5f7c40`, `0x5f7d81`), so a refused entry is asked again by the next
+    /// spawn. Every spawn of a template shares the one pending query.
+    pub(crate) fn request_at_create(
+        &self,
+        guid: u64,
+        fields: &ObjectFields,
+        commands: &NetCommands,
+    ) {
+        if let Some(entry) = Self::key(fields) {
+            self.templates
+                .lookup(entry, || Self::send(entry, guid, commands));
+        }
     }
 
-    /// Records a `SMSG_GAMEOBJECT_QUERY_RESPONSE`; a miss arrives zeroed, so no lock.
+    fn send(entry: u32, guid: u64, commands: &NetCommands) {
+        debug!("go: asking template (entry {entry}, guid {guid:#x})");
+        let _ = commands
+            .0
+            .send(ClientCommand::GameObjectQuery { entry, guid });
+    }
+
+    /// A refused entry (`SMSG_GAMEOBJECT_QUERY_RESPONSE` with the top bit set, `0x5588e0`): no
+    /// template, and the next lookup asks again ([`QueryCache::refuse`]).
+    pub(crate) fn refuse(&mut self, entry: u32) {
+        self.templates.refuse(entry);
+    }
+
+    /// Whether the server refused `entry` and nothing has asked for it since.
+    #[cfg(test)]
+    pub(crate) fn is_unknown(&self, entry: u32) -> bool {
+        self.templates.answered_unknown(entry)
+    }
+
+    /// Records a `SMSG_GAMEOBJECT_QUERY_RESPONSE`.
     pub(crate) fn insert(&mut self, entry: u32, type_id: u32, name: String, data: &[i32; 24]) {
         let lock_id = go_lock_slot(type_id)
             .and_then(|slot| data.get(slot))
@@ -146,7 +165,7 @@ impl GameObjectTemplates {
         };
         self.templates.insert(
             entry,
-            Some(GoTemplate {
+            GoTemplate {
                 lock_id,
                 name,
                 highlight_column,
@@ -155,8 +174,13 @@ impl GameObjectTemplates {
                 mo_transport,
                 text_page,
                 quest_material,
-            }),
+            },
         );
+    }
+
+    /// A template's name by entry, read without a callback (the cache `0xc0e318`).
+    pub(crate) fn name(&self, entry: u32) -> Option<&str> {
+        self.templates.get(entry).map(|t| t.name.as_str())
     }
 
     /// The cached template for a GameObject, found through its own descriptor.
@@ -345,8 +369,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<ClientCommand>();
         let commands = NetCommands(tx);
         let mut t = GameObjectTemplates::default();
-        t.request(boat, &fields, &commands);
-        t.request(boat, &fields, &commands);
+        t.request_at_create(boat, &fields, &commands);
+        t.request_at_create(boat, &fields, &commands);
         let asked: Vec<_> = rx
             .try_iter()
             .map(|c| match c {
@@ -363,7 +387,7 @@ mod tests {
         assert_eq!(mo.map(|m| m.taxi_path_id), Some(292), "read by the field");
 
         // A second object of the same template shares the one query.
-        t.request(boat + 2, &fields, &commands);
+        t.request_at_create(boat + 2, &fields, &commands);
         assert!(rx.try_recv().is_err(), "the cached entry is not re-asked");
     }
 
@@ -373,7 +397,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<ClientCommand>();
         let commands = NetCommands(tx);
         let mut t = GameObjectTemplates::default();
-        t.request(1, &ObjectFields::default(), &commands);
+        t.request_at_create(1, &ObjectFields::default(), &commands);
         assert!(rx.try_recv().is_err());
         t.insert(0, 3, "Chest".into(), &[0; 24]);
         assert!(t.of(&ObjectFields::default()).is_none());

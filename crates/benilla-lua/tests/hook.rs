@@ -183,7 +183,10 @@ fn a_hook_set_while_lua_runs_counts_from_there() {
          local s = 0 arm() for i = 1, 200 do if i > 100 then s = s + i else s = s - 1 end end \
          local function f(x) return x end arm() for i = 1, 100 do f(i) end",
     ] {
-        counts_from_the_arming(src);
+        // The C build's count for each, recorded while it was in the tree, and one more for each
+        // numeric `for` entered: the client's starts with a subtraction and a jump (`0x6fe42c`)
+        // where 5.1 has one `FORPREP`.
+        counts_from_the_arming(src, 1214);
     }
 }
 
@@ -218,7 +221,7 @@ fn a_loop_moved_by_a_hook_keeps_its_index() {
     }
 }
 
-fn counts_from_the_arming(src: &str) {
+fn counts_from_the_arming(src: &str, c: u64) {
     let ours = {
         let mut vm = benilla_lua::new_state();
         let n = Rc::new(Cell::new(0u64));
@@ -242,53 +245,10 @@ fn counts_from_the_arming(src: &str) {
         assert!(!r.starts_with("<raised>"), "{r}");
         n.get()
     };
-    let c = {
-        let lua = mlua::Lua::new();
-        let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let seen = n.clone();
-        let arm = lua
-            .create_function(move |lua, ()| {
-                let seen = seen.clone();
-                lua.set_hook(
-                    mlua::HookTriggers {
-                        every_nth_instruction: Some(1),
-                        ..Default::default()
-                    },
-                    move |_, _| {
-                        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Ok(mlua::VmState::Continue)
-                    },
-                )
-            })
-            .unwrap();
-        lua.globals().set("arm", arm).unwrap();
-        lua.load(src).exec().unwrap();
-        n.load(std::sync::atomic::Ordering::Relaxed)
-    };
     assert!(
         ours <= c && c - ours <= 10,
         "{src}: ours {ours}, the C build's {c}"
     );
-}
-
-/// What the C build's count hook counts for `src`, run at every instruction.
-fn c_instructions(src: &str) -> u64 {
-    let lua = mlua::Lua::new();
-    let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let seen = n.clone();
-    lua.set_hook(
-        mlua::HookTriggers {
-            every_nth_instruction: Some(1),
-            ..Default::default()
-        },
-        move |_, _| {
-            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(mlua::VmState::Continue)
-        },
-    )
-    .unwrap();
-    lua.load(src).exec().unwrap();
-    n.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The count at every instruction is the C build's: an instruction 5.1 never dispatches is not
@@ -296,27 +256,98 @@ fn c_instructions(src: &str) -> u64 {
 /// constant loaded into a scratch register), whichever way the code branches.
 #[test]
 fn the_count_is_the_c_builds() {
-    for src in [
-        "local x, y = 1, 2 local b = x < y",
-        "local x, y = 2, 1 local b = x < y",
-        "local x, y = 1, 2 for i = 1, 10 do local b = x < y local c = y < x end",
-        "table.sort({5, 3, 1, 4, 2, 9, 7}, function(a, b) return a < b end)",
-        "local function f() local a, b return a end for i = 1, 10 do f() end",
-        "local b = 'a' < 'b'",
-        "local x = 'a' .. 'b'",
-        "local x = 1 local y = x == 1",
-        "local t = {1, 2, 3} for k, v in pairs(t) do end",
-        "local t = {1, 2, 3} for k in next, t do end",
-        "local function it(s, c) if c < 5 then return c + 1 end end for i in it, nil, 0 do end",
-        "local t = {} for i = 1, 5 do t[i] = i end local s = 0 for i = 5, 1, -1 do s = s + t[i] end",
-        "local a = nil local b = a and 1 or 2 local c = a or 3 local d = not a",
-        "local function f(...) return arg.n end f(1, 2, 3)",
-        "local t = {1, 2, 3, x = 1, y = 2}",
-        "local x = 0 while x < 5 do x = x + 1 end repeat x = x - 1 until x == 0",
-        "local n = 0 for i = 1, 20 do if math.mod(i, 3) == 0 then n = n + 1 elseif i > 10 then n = n - 1 else n = n * 2 end end",
-        "string.gsub('abcabc', 'b', function(c) return c == 'b' and 'x' or c end)",
-        "local t = setmetatable({}, {__index = function(t, k) return k > 2 end}) for i = 1, 5 do local _ = t[i] end",
+    // The C build's count for each, recorded while it was in the tree.
+    for (src, c) in [
+        ("local x, y = 1, 2 local b = x < y", 5),
+        ("local x, y = 2, 1 local b = x < y", 5),
+        ("local x, y = 1, 2 for i = 1, 10 do local b = x < y local c = y < x end", 59),
+        ("table.sort({5, 3, 1, 4, 2, 9, 7}, function(a, b) return a < b end)", 62),
+        ("local function f() local a, b return a end for i = 1, 10 do f() end", 48),
+        ("local b = 'a' < 'b'", 3),
+        ("local x = 'a' .. 'b'", 4),
+        ("local x = 1 local y = x == 1", 4),
+        ("local t = {1, 2, 3} for k, v in pairs(t) do end", 14),
+        ("local t = {1, 2, 3} for k in next, t do end", 14),
+        ("local function it(s, c) if c < 5 then return c + 1 end end for i in it, nil, 0 do end", 29),
+        ("local t = {} for i = 1, 5 do t[i] = i end local s = 0 for i = 5, 1, -1 do s = s + t[i] end", 40),
+        ("local a = nil local b = a and 1 or 2 local c = a or 3 local d = not a", 6),
+        ("local function f(...) return arg.n end f(1, 2, 3)", 9),
+        ("local t = {1, 2, 3, x = 1, y = 2}", 8),
+        ("local x = 0 while x < 5 do x = x + 1 end repeat x = x - 1 until x == 0", 28),
+        ("local n = 0 for i = 1, 20 do if math.mod(i, 3) == 0 then n = n + 1 elseif i > 10 then n = n - 1 else n = n * 2 end end", 195),
+        ("string.gsub('abcabc', 'b', function(c) return c == 'b' and 'x' or c end)", 15),
+        ("local t = setmetatable({}, {__index = function(t, k) return k > 2 end}) for i = 1, 5 do local _ = t[i] end", 38),
     ] {
-        assert_eq!(instructions(src), c_instructions(src), "{src}");
+        assert_eq!(instructions(src), c, "{src}");
     }
+}
+
+/// A hook that aborts once it has run `limit` times ([`Vm::abort`]).
+fn abort_budget(vm: &mut Vm, limit: u32) {
+    let seen = Rc::new(Cell::new(0));
+    vm.set_hook(
+        1000,
+        Rc::new(move |vm: &mut Vm| {
+            seen.set(seen.get() + 1);
+            if seen.get() >= limit {
+                return Err(vm.abort(b"budget"));
+            }
+            Ok(())
+        }),
+    );
+}
+
+/// An abort unwinds past every `pcall` and `xpcall` to the host, runs no handler, and ends
+/// there: the next run is ordinary.
+#[test]
+fn an_abort_is_caught_by_no_protected_call() {
+    small_stack(|| {
+        let mut vm = benilla_lua::new_state();
+        let cases = [
+            "while true do pcall(function() while true do end end) end",
+            "while true do local ok, e = pcall(function() while true do end end) error(e) end",
+            "handled = nil xpcall(function() while true do end end, function() handled = true \
+             while true do end end)",
+            "xpcall(function() error('x') end, function() while true do end end)",
+            "local function f() return pcall(f) end while true do f() end",
+        ];
+        for src in cases {
+            abort_budget(&mut vm, 10);
+            assert_eq!(run(&mut vm, src), "<raised> budget", "{src}");
+        }
+        vm.remove_hook();
+        assert_eq!(run(&mut vm, "return handled"), "nil");
+        assert_eq!(
+            run(&mut vm, "local ok, e = pcall(error, 'e') return e"),
+            "e",
+            "a later error is caught as ever"
+        );
+    });
+}
+
+/// A handler fired from inside Lua while an abort unwinds still gets its globals put back, raw
+/// past a Lua `__newindex` that would raise the abort again.
+#[test]
+fn an_abort_leaves_the_handler_globals_restored() {
+    fn fire(vm: &mut Vm, _nargs: usize) -> Result<usize, benilla_lua::LuaError> {
+        let f = vm.get_global("Handler");
+        let this = vm.str(b"this");
+        let v = vm.str(b"inner");
+        let r = vm.call_with_globals(f, &[(this.as_str().unwrap(), v)]);
+        Ok(vm.ret1(benilla_lua::Value::Bool(r.is_ok())))
+    }
+    small_stack(|| {
+        let mut vm = benilla_lua::new_state();
+        vm.register("Fire", fire);
+        run(
+            &mut vm,
+            "local store = {this = 'outer'} Handler = function() while true do end end \
+             setmetatable(getfenv(0), {__index = store, \
+               __newindex = function(t, k, v) k = tostring(k) store[k] = v end})",
+        );
+        abort_budget(&mut vm, 10);
+        assert_eq!(run(&mut vm, "Fire() return 1"), "<raised> budget");
+        vm.remove_hook();
+        assert_eq!(run(&mut vm, "return this"), "outer");
+    });
 }

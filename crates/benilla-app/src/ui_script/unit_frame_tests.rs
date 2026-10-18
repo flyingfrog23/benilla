@@ -90,7 +90,7 @@ fn shipped_unit_frames_drive_end_to_end() {
             local r, g, b = pb:GetStatusBarColor()
             return hb:GetValue() == 72 and hmax == 100
                and pb:GetValue() == 45 and pmax == 80 and pb:IsVisible()
-               and b == 1 and r == 0 -- mana blue
+               and math.abs(b - 1) < 1/255 and r == 0 -- mana blue
         "#,
         )
         .unwrap();
@@ -294,10 +294,12 @@ fn unit_combat_drives_the_player_hit_indicator() {
         )
         .unwrap();
     assert!(ok, "physical wound paints the amount ({:?})", s.errors());
+    // `NumberFontNormalHuge` is already 30 (`Fonts.xml:174`), so `SetTextHeight(30)` changes
+    // nothing (`0x77161c`) and the string stays one-to-one, drawn at its font's 30.
     assert_eq!(
         extracted_text_height(&mut s, "17"),
-        Some(30.0),
-        "base height 30 (the SetTextHeight regime)"
+        None,
+        "base height 30 is the font's own, one-to-one"
     );
 
     s.fire_event("UNIT_COMBAT", ev("player", "WOUND", "CRITICAL", 64, 4));
@@ -1153,7 +1155,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
         crate::field_watch::values(
             &crate::field_watch::Around {
                 me: Some(ME),
-                creature_cached: &|_| false,
+                creature_lookup: &|_| false,
                 others: &Vec::new,
                 pet_bar: 0,
             },
@@ -1181,7 +1183,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
         crate::field_watch::values(
             &crate::field_watch::Around {
                 me: Some(ME),
-                creature_cached: &|_| false,
+                creature_lookup: &|_| false,
                 others: &Vec::new,
                 pet_bar: 0,
             },

@@ -154,46 +154,91 @@ fn set_lock_bit(model: &mut Model, guid: u64, locked: bool) {
     }
 }
 
-/// [`UiScript::fire_event`] for a caller holding `&Lua`, such as a Lua binding.
+/// The ten `arg1..arg10` of a `CHAT_MSG_SYSTEM` line with no sender: the text, five empty
+/// strings, two zeros, an empty string and a zero, the shape the app's chat feed gives its own
+/// system lines.
+pub fn system_chat_args(text: String) -> Vec<ScriptValue> {
+    let empty = || ScriptValue::Str(String::new());
+    vec![
+        ScriptValue::Str(text),
+        empty(),
+        empty(),
+        empty(),
+        empty(),
+        empty(),
+        ScriptValue::Int(0),
+        ScriptValue::Int(0),
+        empty(),
+        ScriptValue::Int(0),
+    ]
+}
+
+/// `0x496720` on a chat-kind catalog row from inside a verb: the line reaches the chat frames at
+/// once, as `CHAT_MSG_SYSTEM` (`0x496842` into `0x49a870`, whose event is `0x49ac9a`), and waits
+/// with its key for the app's log files and the row's sound ([`UiScript::take_shown_chat_lines`]).
+pub(crate) fn show_chat_line_into(lua: &Lua, key: &'static str, text: String) {
+    fire_event_into(lua, "CHAT_MSG_SYSTEM", system_chat_args(text.clone()));
+    lua.app_data_mut::<Model>()
+        .expect("model app_data set")
+        .shown_chat_lines
+        .push((key, text));
+}
+
+/// [`UiScript::fire_event`] for a caller holding `&Lua`: `SignalEvent` (`0x703e50`, with args
+/// `0x703f50`). An event with no listener touches nothing; otherwise `event` is set once before
+/// the walk (`0x703ea4`) and the earlier value put back after it (`0x703f04`), so a handler's
+/// assignment to it reaches the next listener. The walk takes each listener's successor before
+/// its call (`0x703ee8`): one appended meanwhile is reached unless the running one was the tail.
 pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
     let model_mut = || lua.app_data_mut::<Model>().expect("model app_data set");
-    if !model_mut().vm.fires(event) {
+    let mut at = {
+        let model = model_mut();
+        model
+            .event_to_frames
+            .get(event)
+            .and_then(|l| l.first().copied())
+    };
+    if at.is_none() {
         return;
     }
-    {
-        let mut at = {
-            let model = model_mut();
-            model
-                .event_to_frames
-                .get(event)
-                .and_then(|l| l.first().copied())
-        };
-        while let Some(h) = at {
-            let mut model = model_mut();
-            // A saved next that the previous handler unregistered ends the walk.
-            let Some(pos) = model
-                .event_to_frames
-                .get(event)
-                .and_then(|l| l.iter().position(|&x| x == h))
-            else {
-                break;
-            };
-            let next = model
-                .event_to_frames
-                .get(event)
-                .and_then(|l| l.get(pos + 1).copied());
-            let id = model.frame_id(h);
-            drop(model);
-            if let Err(e) = event::fire_event_handler(lua, id, event, &args) {
-                model_mut().record_lua_error(&e);
-            }
-            at = next;
-        }
+    let globals = lua.globals();
+    let saved = globals.get::<mlua::Value>("event").ok();
+    if let Ok(name) = lua.create_string(event) {
+        let _ = globals.set("event", name);
     }
-    event::fire_all_event_listeners(lua, event, &args);
+    while let Some(h) = at {
+        let mut model = model_mut();
+        // A saved next that the previous handler unregistered ends the walk.
+        let Some(pos) = model
+            .event_to_frames
+            .get(event)
+            .and_then(|l| l.iter().position(|&x| x == h))
+        else {
+            break;
+        };
+        let next = model
+            .event_to_frames
+            .get(event)
+            .and_then(|l| l.get(pos + 1).copied());
+        let id = model.frame_id(h);
+        drop(model);
+        if let Err(e) = event::fire_event_handler(lua, id, &args) {
+            model_mut().record_lua_error(&e);
+        }
+        at = next;
+    }
+    if let Some(saved) = saved {
+        let _ = globals.set("event", saved);
+    }
 }
 
 impl super::UiScript {
+    /// The catalog lines a verb showed in chat since the last call, by message key, for the log
+    /// files and the sound the app keeps.
+    pub fn take_shown_chat_lines(&mut self) -> Vec<(&'static str, String)> {
+        std::mem::take(&mut self.model_mut().shown_chat_lines)
+    }
+
     /// Advance a frame: the `GetTime()` clock and queued events, then the pump `0x765650` and the
     /// draw pass `0x7657d0`, in that order (`0x764340`, `0x764347`). The pump drains the layout
     /// queue (`0x768ed0`, at `0x7656ba`), whose rect applications fire `OnSizeChanged`; runs the

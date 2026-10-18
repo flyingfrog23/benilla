@@ -14,6 +14,72 @@ mod loader_tests {
         framexml::parse(text).expect("valid FrameXML")
     }
 
+    /// The Minimap's post-load (`0x4ee2b0`) runs `CSimpleFrame`'s first (`0x4ee2c0`), so its own
+    /// `OnLoad` finds the player arrow with no model yet.
+    #[test]
+    fn the_minimap_models_land_after_its_onload() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            r#"<Ui>
+                <Minimap name="Minimap">
+                    <Scripts><OnLoad>seen = ({this:GetChildren()})[9]:GetModel() or "none"</OnLoad></Scripts>
+                </Minimap>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(s.eval::<String>("return seen").unwrap(), "none");
+        assert_eq!(
+            s.eval::<String>("return ({Minimap:GetChildren()})[9]:GetModel()")
+                .unwrap(),
+            "Interface\\Minimap\\MinimapArrow.mdx"
+        );
+    }
+
+    /// `CreateFrame("Minimap")` runs the same post-load hook (`0x70628b` → `0x6ee280` → slot 0x24 at
+    /// `0x6ee4ea`, `0x4ee2b0`): after the template's `OnLoad`, the stock models and their sequences.
+    #[test]
+    fn a_created_minimap_takes_the_stock_models_after_its_onload() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="MinimapTpl" virtual="true">
+                    <Scripts><OnLoad>seen = ({this:GetChildren()})[9]:GetModel() or "none"</OnLoad></Scripts>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        s.run(r#"m = CreateFrame("Minimap", "Made", nil, "MinimapTpl") bare = CreateFrame("Minimap")"#)
+            .unwrap();
+        assert_eq!(s.eval::<String>("return seen").unwrap(), "none");
+        for frame in ["m", "bare"] {
+            assert_eq!(
+                s.eval::<String>(&format!("return ({{{frame}:GetChildren()}})[9]:GetModel()"))
+                    .unwrap(),
+                crate::widget::MINIMAP_DEFAULT_PLAYER_MODEL,
+                "{frame}"
+            );
+            for i in 1..=8 {
+                assert_eq!(
+                    s.eval::<String>(&format!(
+                        "return ({{{frame}:GetChildren()}})[{i}]:GetModel()"
+                    ))
+                    .unwrap(),
+                    crate::widget::MINIMAP_DEFAULT_ARROW_MODEL,
+                    "{frame} child {i}"
+                );
+            }
+        }
+        let made = s.minimap_child("Made", 1).unwrap();
+        assert_eq!(made.sequence, i32::from(crate::script::MINIMAP_GROUP_ARROW));
+        let made = s.minimap_child("Made", 6).unwrap();
+        assert_eq!(
+            made.sequence,
+            i32::from(crate::script::MINIMAP_LANDMARK_ARROW)
+        );
+    }
+
     /// `CMinimap::LoadXML 0x4ee2b0`: `minimapArrowModel` goes to engine children 1-8 (`0x4ee170`),
     /// `minimapPlayerModel` to child 9 alone (`[Minimap+0x338]`, `0x4ee260`); without the
     /// attributes the defaults are `0x84c768` and `0x8453c0`. `Minimap.xml:97` sets both.
@@ -42,6 +108,11 @@ mod loader_tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
 
         for i in 1..=8 {
+            assert_eq!(
+                s.minimap_child("Minimap", i).unwrap().sequence,
+                if i <= 5 { 165 } else { 166 },
+                "child {i} plays GroupArrow or Arrow (`0x4ee1de`, `0x4ee22b`)"
+            );
             assert_eq!(
                 s.eval::<String>(&format!(
                     "return ({{Minimap:GetChildren()}})[{i}]:GetModel()"
@@ -922,7 +993,7 @@ mod loader_tests {
         assert!(s.eval::<bool>("return Real ~= nil").unwrap());
         // The Lua door raises on the same lookup.
         let err = s.run(r#"CreateFrame("Bogus")"#).unwrap_err().to_string();
-        assert!(err.contains("unknown frame type 'Bogus'"), "{err}");
+        assert!(err.contains("Unknown frame type 'Bogus'"), "{err}");
     }
 
     /// A `.toc` line hands a listed `Bindings.xml` to `0x6ede10` (from `0x6edd51`), so each
@@ -1002,7 +1073,7 @@ mod loader_tests {
             return mn == 0 and mx == 100 and XmlBar:GetValue() == 50
                 and XmlBar:GetOrientation() == "HORIZONTAL"
                 and XmlBar:GetStatusBarTexture() ~= nil
-                and r < 0.2 and g > 0.8 and a == 1
+                and r < 0.2 and g > 0.8 and a > 0.99
         "#,
             )
             .unwrap();
@@ -1553,13 +1624,20 @@ mod loader_tests {
         let base = s.font_object("Base").expect("Base registered");
         assert_eq!(base.font.as_deref(), Some("Fonts\\FRIZQT__.TTF"));
         assert_eq!(base.height, Some(12.0));
-        assert_eq!(base.color, Some([1.0, 0.82, 0.0, 1.0]));
+        assert_eq!(
+            base.color,
+            Some(crate::color::Rgba8::from_f32([1.0, 0.82, 0.0, 1.0]))
+        );
 
-        // Leaf: Base's face through Mid, Mid's white, its own height of 10.
+        // Leaf: Base's face and height through Mid, and Mid's white; its own `<FontHeight>` has
+        // no `font=` beside it, so it is never read (`0x783cf1`).
         let leaf = s.font_object("Leaf").expect("Leaf registered");
         assert_eq!(leaf.font.as_deref(), Some("Fonts\\FRIZQT__.TTF"));
-        assert_eq!(leaf.height, Some(10.0));
-        assert_eq!(leaf.color, Some([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(leaf.height, Some(12.0));
+        assert_eq!(
+            leaf.color,
+            Some(crate::color::Rgba8::from_f32([1.0, 1.0, 1.0, 1.0]))
+        );
     }
 
     #[test]
@@ -1615,7 +1693,7 @@ mod loader_tests {
         assert!(matches!(
             &small.content,
             QuadContent::Text { font: Some(f), color: Some(c), .. }
-                if f == "Fonts\\FRIZQT__.TTF" && *c == [1.0, 0.82, 0.0, 1.0]
+                if f == "Fonts\\FRIZQT__.TTF" && *c == crate::color::quant::drawn([1.0, 0.82, 0.0, 1.0])
         ));
     }
 
@@ -1658,7 +1736,7 @@ mod loader_tests {
         assert!(matches!(
             &a.content,
             QuadContent::Text { color: Some(c), font_height: Some(h), .. }
-                if *c == [0.1, 0.2, 0.3, 1.0] && *h == 12.0
+                if *c == crate::color::quant::drawn([0.1, 0.2, 0.3, 1.0]) && *h == 12.0
         ));
         // B's unknown font object leaves it with no font: it holds its text and draws none
         // (`0x7724f8`).
@@ -1981,7 +2059,7 @@ mod loader_tests {
             .expect("the <NormalText> label must paint");
         assert_eq!(
             label,
-            Some([0.9, 0.8, 0.1, 1.0]),
+            Some(crate::color::quant::drawn([0.9, 0.8, 0.1, 1.0])),
             "<NormalText inherits=> must reach the button's Normal-state font"
         );
     }
@@ -2238,13 +2316,14 @@ mod loader_tests {
         let green = s
             .eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"H1\")")
             .unwrap();
-        assert_eq!(green, (0.0, 1.0, 0.0, 1.0));
+        let one = crate::color::quant::read32(1.0);
+        assert_eq!(green, (0.0, one, 0.0, one));
         let p = s
             .eval::<(f32, f32, f32, f32)>("return Page:GetTextColor()")
             .unwrap();
         assert_ne!(
             p,
-            (1.0, 0.0, 0.0, 1.0),
+            (one, 0.0, 0.0, one),
             "the refused element's Color is not read"
         );
     }
@@ -2388,8 +2467,9 @@ mod loader_tests {
     /// state-texture element builds a new region through the `<Layers>` adder (`0x6f26f0`) that the
     /// slot store installs, destroying the one it displaces (`0x778fd0` via `0x77900a`, the
     /// highlight's `0x779110`, the checked pair's `0x785330`/`0x785440`). So an instance's element
-    /// keeps nothing of the template's: the fresh region's TexCoords, alpha and BLEND (`0x76fc40`;
-    /// the highlight keeps its own, `0x7789a4`), and `SetAllPoints` with no anchors (`0x7701c0`).
+    /// keeps nothing of the template's: the fresh region's TexCoords and BLEND (`0x76fc40`; the
+    /// highlight keeps its own, `0x7789a4`), and `SetAllPoints` with no anchors (`0x7701c0`). No
+    /// texture level reads `alpha` (`0x76fe20`), so every alpha stays 1.
     #[test]
     fn an_instance_state_texture_replaces_the_templates() {
         const TAGS: [(&str, &str); 6] = [
@@ -2481,7 +2561,8 @@ mod loader_tests {
             "one region per slot, none of the template's left over"
         );
 
-        // An instance element's own size, anchors and alpha lay the fresh region out.
+        // An instance element's own size and anchors lay the fresh region out; its `alpha=` is not
+        // read.
         let laid: (i64, String, f32, f32, f32, Vec<f32>) = s
             .eval(
                 r#"local t = LaidOutInst:GetNormalTexture()
@@ -2496,7 +2577,7 @@ mod loader_tests {
                 "CENTER".to_string(),
                 20.0,
                 16.0,
-                0.25,
+                1.0,
                 vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
             )
         );
@@ -2594,7 +2675,8 @@ mod loader_tests {
                 "Interface\\After".to_string(),
                 vec![0.25, 0.25, 0.25, 0.75, 0.75, 0.25, 0.75, 0.75],
                 "MOD".to_string(),
-                0.5,
+                // `SetAlpha(0.5)` is the byte 127 (`0x79b638`).
+                127.0 / 255.0,
                 1,
                 "TOPLEFT".to_string(),
             )
@@ -2633,19 +2715,56 @@ mod layer_blend_tests {
         let mut s = s;
         s.set_screen_size(800.0, 600.0);
         s.resolve();
-        let additive = s
+        let blend = s
             .extract()
             .iter()
             .find_map(|q| match &q.content {
                 QuadContent::Texture {
                     path: Some(p),
-                    additive,
+                    blend,
                     ..
-                } if p == "Interface\\Glow" => Some(*additive),
+                } if p == "Interface\\Glow" => Some(*blend),
                 _ => None,
             })
             .expect("the layer texture extracted");
-        assert!(additive, "alphaMode=ADD must ride into the quad blend flag");
+        assert_eq!(
+            blend,
+            crate::script::BlendMode::Add,
+            "alphaMode=ADD must ride into the quad blend"
+        );
+    }
+
+    /// `alphaMode=` (`0x770176`) skips an empty value and ignores an unknown one with no log
+    /// (`0x770185`, `0x770195`), where `SetBlendMode` raises; a known one is any case.
+    #[test]
+    fn an_unknown_alpha_mode_is_ignored_without_a_fault() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="ModeHost">
+                    <Layers><Layer level="ARTWORK">
+                        <Texture name="ModeBogus" file="Interface\Bogus" alphaMode="ADDITIVE"/>
+                        <Texture name="ModeEmpty" file="Interface\Empty" alphaMode=""/>
+                        <Texture name="ModeMod" file="Interface\Mod" alphaMode="mod"/>
+                    </Layer></Layers>
+                </Frame>
+            </Ui>"#,
+        )
+        .unwrap();
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
+        let modes: (String, String, String) = s
+            .eval(
+                "return ModeBogus:GetBlendMode(), ModeEmpty:GetBlendMode(), \
+                 ModeMod:GetBlendMode()",
+            )
+            .unwrap();
+        assert_eq!(modes, ("BLEND".into(), "BLEND".into(), "MOD".into()));
     }
 }
 

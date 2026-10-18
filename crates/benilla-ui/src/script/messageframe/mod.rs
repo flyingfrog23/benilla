@@ -11,7 +11,7 @@
 use crate::layout::Rect;
 use crate::order::ZTarget;
 use crate::script::object::frame_handle_of;
-use crate::widget::{FrameHandle, InsertMode, KindState, MessageLine};
+use crate::widget::{FrameHandle, InsertMode, KindState, MessageLine, Viewport};
 
 use super::layout::FramePaint;
 use super::{
@@ -33,13 +33,36 @@ pub(super) use scrolling::REG_SCROLLINGMESSAGEFRAME_METHODS;
 /// [`MessageFrameState::trim_to_viewport`]: crate::widget::MessageFrameState::trim_to_viewport
 pub(super) fn update(model: &mut Model, h: FrameHandle, elapsed: f32) {
     let rows = UiScript::message_viewport_rows(model, h);
+    let viewport = UiScript::message_viewport(model, h);
+    let layout_key = UiScript::message_layout_key(model, h);
     match model.arena.frame_mut(h).map(|f| &mut f.kind_state) {
         Some(KindState::Message(mf)) => {
             mf.trim_to_viewport(rows);
             mf.tick(elapsed);
         }
-        Some(KindState::ScrollingMessage(smf)) => smf.tick(elapsed),
+        Some(KindState::ScrollingMessage(smf)) => {
+            // A resize or a font change relayouts at the current position (`0x788427`,
+            // `0x788086`), as a show does (`0x788451`, [`on_visibility`]).
+            if smf.laid.replace(layout_key) != Some(layout_key) {
+                smf.relayout(viewport);
+            }
+            smf.tick(elapsed, viewport)
+        }
         _ => {}
+    }
+}
+
+/// A scrolling frame's show relayouts (`0x788451`): forget what it laid out against, so its next
+/// update does.
+pub(super) fn on_visibility(lua: &mlua::Lua, h: FrameHandle, visible: bool) {
+    if !visible {
+        return;
+    }
+    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+    if let Some(KindState::ScrollingMessage(smf)) =
+        model.arena.frame_mut(h).map(|f| &mut f.kind_state)
+    {
+        smf.laid = None;
     }
 }
 
@@ -84,11 +107,7 @@ pub(super) fn shown_text<'a>(
 /// Install `SetJustifyH`, `GetJustifyH`, `SetJustifyV` and `GetJustifyV`, which both classes carry,
 /// under [`crate::justify`]'s rules: an unknown token raises the usage line, and a token of the
 /// other axis clears this one, so `GetJustifyH()` then answers `"UNKNOWN"`.
-pub(super) fn install_justify(
-    lua: &mlua::Lua,
-    m: &mlua::Table,
-    widget: &'static str,
-) -> mlua::Result<()> {
+pub(super) fn install_justify(lua: &mlua::Lua, m: &mlua::Table) -> mlua::Result<()> {
     use crate::justify::{self, Justify};
 
     fn slot(ks: &mut KindState) -> Option<&mut Option<Justify>> {
@@ -113,17 +132,17 @@ pub(super) fn install_justify(
         m.set(
             name,
             lua.create_function(move |lua, (this, token): (mlua::Table, mlua::Value)| {
-                let parsed = token
-                    .as_string()
-                    .and_then(|t| t.to_str().ok().and_then(|t| justify::parse_bits(&t)))
+                let h = frame_handle_of(lua, &this)?;
+                let parsed = crate::script::binding_abi::optional_string(lua, &token)
+                    .and_then(|t| justify::parse_bits(&t))
                     .ok_or_else(|| {
+                        let name = crate::script::binding_abi::name_of(lua, &this);
                         if horizontal {
-                            justify::usage_h(widget)
+                            justify::usage_h(&name)
                         } else {
-                            justify::usage_v(widget)
+                            justify::usage_v(&name)
                         }
                     })?;
-                let h = frame_handle_of(lua, &this)?;
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 let frame = model
                     .arena
@@ -184,6 +203,7 @@ pub(super) struct MessageFont {
     pub(super) height: Option<f32>,
     pub(super) shadow: Option<FontShadow>,
     pub(super) outline: Outline,
+    pub(super) monochrome: bool,
     /// The child's `justifyH`, which centres `UIErrorsFrame`'s lines and keeps chat flush left;
     /// LEFT without a declared FontString, not the FontString default of CENTER.
     pub(super) justify_h: JustifyH,
@@ -208,11 +228,30 @@ impl MessageFont {
         self.height.unwrap_or(14.0)
     }
 
-    /// The gap between a line string's rows and, in the scrolling class, between messages: each
-    /// line string inherits the frame's font (`0x7888fd`) through the clamping setter (`0x7708fd`
-    /// → `0x772240`), and the stack snaps its field (`0x78899e` → `0x766750`).
-    fn line_gap(&self, scale: f32) -> f32 {
+    /// The gap between the rows of one message: each line string inherits the frame's font
+    /// (`0x7888fd`) through the clamping setter (`0x7708fd` → `0x772240`), and the block height
+    /// forms the spacing times the scale (`0x772a07`-`0x772a0d`), which `GxuFontGetTextBlockHeight`
+    /// rounds up to a whole pixel (`0x5c2143`-`0x5c215c`, `+0.99999`).
+    fn row_gap(&self, scale: f32) -> f32 {
         snap_px(self.spacing.max(0.0) * scale)
+    }
+
+    /// The scrolling class's gap between one message and the next: the stack snaps the unscaled
+    /// spacing (`0x78899e` → `0x766750`) and anchors the next line at that offset in frame units
+    /// (`0x788954`-`0x788975`), so on screen it is the snapped spacing times the scale.
+    fn message_gap(&self, scale: f32) -> f32 {
+        snap_px(self.spacing.max(0.0)) * scale
+    }
+
+    /// What the scrolling class's layout fits messages into: a frame `height` tall, drawn at
+    /// `scale`.
+    fn viewport(&self, height: f32, scale: f32) -> Viewport {
+        Viewport {
+            height,
+            line_h: self.height_or_default() * scale,
+            row_gap: self.row_gap(scale),
+            message_gap: self.message_gap(scale),
+        }
     }
 
     /// The plain class's pitch, its fit and its slot step (`0x785f03`-`0x785f2a`, `0x786184`): the
@@ -278,6 +317,7 @@ impl UiScript {
                         height: d.font_height,
                         shadow: d.font_shadow,
                         outline: d.outline,
+                        monochrome: d.monochrome,
                         justify_h: d.justify.paint_h(),
                         spacing: d.spacing,
                     })
@@ -287,31 +327,56 @@ impl UiScript {
                 height: None,
                 shadow: None,
                 outline: Outline::default(),
+                monochrome: false,
                 justify_h: JustifyH::Left,
                 spacing: 0.0,
             })
     }
 
-    /// How many rows frame `fh`'s resolved rect holds at its font's pitch, the client's
-    /// `numLinesDisplayed`: the scrolling class's page size and the plain class's capacity. Both
-    /// the rect and the pitch are scaled (`0x785f0a`, `0x785f1f`); a pitch of 0 or less, which a
-    /// negative spacing can make on the plain class, holds nothing (`0x785f8f`).
+    /// How many rows the plain frame `fh`'s resolved rect holds at its font's pitch, its capacity
+    /// (`+0x318`). Both the rect and the pitch are scaled (`0x785f0a`, `0x785f1f`); a pitch of 0
+    /// or less, which a negative spacing can make, holds nothing (`0x785f8f`).
     pub(super) fn message_viewport_rows(model: &Model, fh: FrameHandle) -> usize {
         let font = Self::message_frame_font(model, fh);
         let Some(frame) = model.arena.frame(fh) else {
             return 0;
         };
-        let scale = frame.effective_scale;
-        let pitch = match frame.kind_state {
-            KindState::Message(_) => font.plain_pitch(scale),
-            _ => font.height_or_default() * scale + font.line_gap(scale),
-        };
+        let pitch = font.plain_pitch(frame.effective_scale);
         if pitch <= 0.0 {
             return 0;
         }
         model.resolved.get(&fh).map_or(0, |r| {
             ((r.top - r.bottom) / pitch).floor().max(0.0) as usize
         })
+    }
+
+    /// The viewport of the scrolling frame `fh`'s resolved rect. The relayout divides the rect by
+    /// the scale (`0x7887d4`) and the heights it spends are in the same units, so this is the same
+    /// quantity scaled; no rect yet is no height, which still shows the anchored message.
+    pub(super) fn message_viewport(model: &Model, fh: FrameHandle) -> Viewport {
+        let font = Self::message_frame_font(model, fh);
+        let scale = model.arena.frame(fh).map_or(1.0, |f| f.effective_scale);
+        let height = model
+            .resolved
+            .get(&fh)
+            .map_or(0.0, |r| (r.top - r.bottom).max(0.0));
+        font.viewport(height, scale)
+    }
+
+    /// What the scrolling frame `fh`'s relayout lays out against: its size and its font.
+    pub(super) fn message_layout_key(model: &Model, fh: FrameHandle) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let font = Self::message_frame_font(model, fh);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(r) = model.resolved.get(&fh) {
+            (r.right - r.left).to_bits().hash(&mut hasher);
+            (r.top - r.bottom).to_bits().hash(&mut hasher);
+        }
+        font.path.hash(&mut hasher);
+        font.height.map(f32::to_bits).hash(&mut hasher);
+        font.spacing.to_bits().hash(&mut hasher);
+        (font.outline as u8).hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Message lines whose wrapped row count needs a host measure. Call after
@@ -443,8 +508,10 @@ impl UiScript {
     /// own pitch, the raw spacing included ([`MessageFont::plain_pitch`]). A scrolling frame stacks
     /// up from the bottom, `scroll_offset` choosing the bottom message. A MessageFrame does too for `insertMode` BOTTOM, and for TOP hangs the newest off
     /// the top edge (`UIErrorsFrame.xml:4`); the reference's anchor per mode is untraced, and this
-    /// reading reproduces both stock uses. A message that partly fits draws clipped; a faded
-    /// scrolling line keeps its rows, as the reference never re-packs chat.
+    /// reading reproduces both stock uses. The scrolling class draws the messages its layout
+    /// places ([`crate::widget::ScrollingMessageState::displayed_count`]): the anchored one, then
+    /// only those that fit whole. A faded one keeps its rows, as the reference never re-packs
+    /// chat. The plain class draws its bands as far as the frame reaches.
     pub(super) fn emit_message_lines(
         model: &Model,
         fh: FrameHandle,
@@ -483,13 +550,14 @@ impl UiScript {
         };
         // The resolved rect is scaled and the font is frame-local, so the height and gap scale.
         let line_h = font.height_or_default() * paint.scale;
-        let gap = font.line_gap(paint.scale);
-        // A row's advance: the scrolling class's height plus gap, the plain class's own pitch.
-        let row_step = match &frame.kind_state {
-            KindState::Message(_) => font.plain_pitch(paint.scale),
-            _ => line_h + gap,
+        let viewport = font.viewport(fr.top - fr.bottom, paint.scale);
+        // A message's advance to the next: the scrolling class's block and snapped gap, the plain
+        // class's own pitch per row.
+        let advance = |rows: u16| match &frame.kind_state {
+            KindState::Message(_) => f32::from(rows.max(1)) * font.plain_pitch(paint.scale),
+            _ => viewport.cost(rows),
         };
-        if line_h <= 0.0 || row_step <= 0.0 || fr.top <= fr.bottom {
+        if line_h <= 0.0 || advance(1) <= 0.0 || fr.top <= fr.bottom {
             return;
         }
         // Clip to the frame, intersected with any ScrollFrame ancestor's clip.
@@ -503,20 +571,22 @@ impl UiScript {
         // one, the order its link rebuild walks them (`0x788c8d`-`0x788d7d`), so the spans reach
         // [`super::hyperlink`] in the reference's placement order.
         let first = out.len();
-        let reverse = matches!(frame.kind_state, KindState::ScrollingMessage(_));
-        for idx in (0..=top_index).rev() {
-            if used >= fr.top - fr.bottom {
+        let (reverse, shown) = match &frame.kind_state {
+            KindState::ScrollingMessage(smf) => (true, smf.displayed_count(viewport)),
+            _ => (false, usize::MAX),
+        };
+        for idx in (0..=top_index).rev().take(shown) {
+            if !reverse && used >= fr.top - fr.bottom {
                 break; // the next band starts outside the frame
             }
             let line = &lines[idx];
-            let rows = f32::from(line.rows.max(1));
-            let band_h = rows * line_h + (rows - 1.0) * gap;
+            let band_h = viewport.block(line.rows);
             let (bottom, top) = if from_top {
                 (fr.top - used - band_h, fr.top - used)
             } else {
                 (fr.bottom + used, fr.bottom + used + band_h)
             };
-            used += rows * row_step;
+            used += advance(line.rows);
             if line.alpha <= 0.0 {
                 continue; // faded: holds its rows, draws nothing
             }
@@ -550,6 +620,7 @@ impl UiScript {
                     font_height: font.height,
                     text_height: None, // message lines have no SetTextHeight
                     outline: font.outline,
+                    monochrome: font.monochrome,
                     // The line string's own field, clamped; the host snaps it.
                     spacing: font.spacing.max(0.0),
                     alpha_gradient: None,

@@ -145,7 +145,15 @@ impl super::UiScript {
                     .quest_log
                     .entries
                     .iter()
-                    .filter_map(|e| e.detail.as_ref()?.reward_spell.as_ref()),
+                    .filter(|e| !e.is_header)
+                    .filter_map(|e| {
+                        model
+                            .quest_store
+                            .records
+                            .get(&e.quest_id)?
+                            .reward_spell
+                            .as_ref()
+                    }),
             )
             .map(|s| s.spell_id);
         let craft = model
@@ -183,7 +191,7 @@ pub(crate) struct SpellWait {
 }
 
 /// Each shown line's left and right cell as `(text, colour)`.
-type Drawn = Vec<(Option<String>, Option<[f32; 4]>)>;
+type Drawn = Vec<(Option<String>, Option<crate::color::Rgba8>)>;
 
 fn drawn_lines(model: &mut Model, h: FrameHandle) -> mlua::Result<Drawn> {
     let t = tip_mut(model, h)?;
@@ -239,8 +247,11 @@ fn answer_wait(lua: &Lua, h: FrameHandle, spell_id: u32, alt_caster: bool) -> ml
         wait.fallback_name,
         wait.opts,
         wait.remaining,
-    )
-    .map(|_| ())
+    )?;
+    // As the reference's spell callback sizes after its builder's show (`0x52f869`).
+    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+    super::tooltip::size_tooltip(&mut model, h);
+    Ok(())
 }
 
 /// The view store and its asks for the unit a render is built against: the pet's when the
@@ -864,8 +875,8 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             let id = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 model
-                    .selected_quest_detail()
-                    .and_then(|d| d.reward_spell.as_ref())
+                    .selected_quest_record()
+                    .and_then(|r| r.reward_spell.as_ref())
                     .map(|s| (s.spell_id, s.name.clone()))
             };
             set_reward_spell(lua, &this, id)
