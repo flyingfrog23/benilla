@@ -374,9 +374,9 @@ fn snapshot_aura_block(
     fields: &crate::messages::update_object::ObjectFields,
 ) -> (AuraSlots, AuraSlots) {
     use crate::messages::update_object::UNIT_AURA_POSITIVE_SLOTS;
-    fields
-        .unit_auras()
-        .map(|a| (a.slot, a.spell_id as u16))
+    (0..super::UNIT_AURA_SLOTS)
+        .filter_map(|slot| fields.unit_aura(slot))
+        .map(|a| (a.slot as u8, a.spell_id as u16))
         .filter(|&(_, id)| id != 0)
         .partition(|&(slot, _)| slot < UNIT_AURA_POSITIVE_SLOTS)
 }

@@ -131,7 +131,16 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::ItemQueryResponse { entry, info } => {
             vec![SessionEvent::ItemTemplate { entry, info }]
         }
-        ServerPacket::MessageChat(m) => vec![SessionEvent::Chat(m)],
+        ServerPacket::MessageChat(m) => {
+            if crate::messages::extended_auras::is_snapshot(&m) {
+                crate::messages::extended_auras::parse_snapshot(&m)
+                    .map(SessionEvent::ExtendedAuras)
+                    .into_iter()
+                    .collect()
+            } else {
+                vec![SessionEvent::Chat(m)]
+            }
+        }
         ServerPacket::ChannelNotify(n) => vec![SessionEvent::ChannelNotify {
             notice: n.notice,
             channel: n.channel,

@@ -47,5 +47,115 @@
             end
         end
         RegisterForSave("FRIENDNAMEPLATES_ON")
+
+        -- Deviation: negotiated aura overflow UI, built into this fork; stock FrameXML stays intact.
+        -- This is original addon code, independent of the game's Interface files.
+        local PAGE_SIZE = 36
+        local MAX_DEBUFFS = 255
+        local panels
+
+        local function Refresh(panel)
+            local count = 0
+            for index = 1, MAX_DEBUFFS do
+                if not UnitDebuff(panel.unit, index) then break end
+                count = index
+            end
+            if count <= panel.legacySlots then
+                panel:Hide()
+                return
+            end
+            panel:Show()
+            local pages = math.max(1, math.floor((count - panel.legacySlots + PAGE_SIZE - 1) / PAGE_SIZE))
+            panel.page = math.min(panel.page, pages)
+            panel.label:SetText(panel.unit.." debuffs "..(panel.legacySlots + 1).."-"..count.."  "..panel.page.."/"..pages)
+            for i = 1, PAGE_SIZE do
+                local button = panel.buttons[i]
+                button.index = panel.legacySlots + (panel.page - 1) * PAGE_SIZE + i
+                local icon, stacks = UnitDebuff(panel.unit, button.index)
+                if icon then
+                    button.icon:SetTexture(icon)
+                    button.count:SetText(stacks and stacks > 1 and stacks or "")
+                    button:Show()
+                else
+                    button:Hide()
+                end
+            end
+        end
+
+        local function Panel(unit, legacySlots, anchor)
+            local panel = CreateFrame("Frame", "BenillaExtendedAuras_"..unit, UIParent)
+            panel.unit = unit
+            panel.page = 1
+            panel.legacySlots = legacySlots
+            panel.buttons = {}
+            panel:SetWidth(244)
+            panel:SetHeight(98)
+            if unit == "player" then
+                panel:SetPoint("TOPRIGHT", anchor or UIParent, "BOTTOMRIGHT", 0, -12)
+            else
+                panel:SetPoint("TOPLEFT", anchor or UIParent, "BOTTOMLEFT", 5, -40)
+            end
+            panel.label = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            panel.label:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
+            for i = 1, PAGE_SIZE do
+                local button = CreateFrame("Button", "BenillaExtendedAuras_"..unit.."_"..i, panel)
+                button.unit = unit
+                button:SetWidth(18)
+                button:SetHeight(18)
+                button:SetPoint("TOPLEFT", panel, "TOPLEFT",
+                    math.mod(i - 1, 12) * 20, -18 - math.floor((i - 1) / 12) * 20)
+                button.icon = button:CreateTexture(nil, "ARTWORK")
+                button.icon:SetAllPoints(button)
+                button.count = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                button.count:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 0, 0)
+                button:SetScript("OnEnter", function()
+                    GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+                    GameTooltip:SetUnitDebuff(this.unit, this.index)
+                end)
+                button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                panel.buttons[i] = button
+            end
+            local previous = CreateFrame("Button", "BenillaExtendedAuras_"..unit.."_Previous", panel)
+            previous:SetWidth(24)
+            previous:SetHeight(18)
+            previous:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 0, 0)
+            local label = previous:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            label:SetAllPoints(previous)
+            label:SetText("<")
+            previous:SetScript("OnClick", function()
+                panel.page = math.max(1, panel.page - 1)
+                Refresh(panel)
+            end)
+            local next = CreateFrame("Button", "BenillaExtendedAuras_"..unit.."_Next", panel)
+            next:SetWidth(24)
+            next:SetHeight(18)
+            next:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 28, 0)
+            label = next:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            label:SetAllPoints(next)
+            label:SetText(">")
+            next:SetScript("OnClick", function()
+                panel.page = panel.page + 1
+                Refresh(panel)
+            end)
+            panel:SetScript("OnEvent", function()
+                if event == "PLAYER_TARGET_CHANGED" and panel.unit == "target" then panel.page = 1 end
+                if event == "UNIT_AURA" and arg1 ~= panel.unit then return end
+                Refresh(panel)
+            end)
+            panel:RegisterEvent("UNIT_AURA")
+            panel:RegisterEvent("PLAYER_AURAS_CHANGED")
+            panel:RegisterEvent("PLAYER_TARGET_CHANGED")
+            panel:RegisterEvent("PLAYER_ENTERING_WORLD")
+            Refresh(panel)
+            return panel
+        end
+
+        -- Called by the aura feed only after a valid server snapshot. No addon registry or install step.
+        function BenillaExtendedAurasUpdate()
+            if not panels then
+                panels = {Panel("player", 8, BuffFrame), Panel("target", 16, TargetFrame)}
+            end
+            for _, panel in ipairs(panels) do Refresh(panel) end
+        end
     ]]></Script>
 </Ui>

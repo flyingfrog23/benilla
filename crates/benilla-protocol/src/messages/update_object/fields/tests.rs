@@ -446,6 +446,7 @@ fn aura_slots_unpack_nibbles_bytes_and_the_stack_bias() {
     assert_eq!(
         buff,
         UnitAuraSlot {
+            caster_guid: 0,
             slot: 0,
             spell_id: 1126,
             flags: 0x9,
@@ -472,6 +473,7 @@ fn aura_slots_unpack_nibbles_bytes_and_the_stack_bias() {
     assert_eq!(
         debuff,
         UnitAuraSlot {
+            caster_guid: 0,
             slot: 32,
             spell_id: 589,
             flags: 0x2,

@@ -150,8 +150,11 @@ pub const AURA_FLAG_EFF_INDEX_MASK: u8 = 0x0E;
 /// on the descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnitAuraSlot {
-    /// Also the buff or debuff class, and the key `SMSG_UPDATE_AURA_DURATION` uses.
-    pub slot: u8,
+    /// Also the buff or debuff class. Deviation: u16 holds negotiated slots through 286;
+    /// the unchanged vanilla duration packet still carries a u8 legacy slot.
+    pub slot: u16,
+    /// Deviation: the extension carries the caster; legacy fields report 0 (unknown).
+    pub caster_guid: u64,
     pub spell_id: u32,
     /// The raw `UNIT_FIELD_AURAFLAGS` nibble.
     pub flags: u8,
@@ -164,7 +167,7 @@ pub struct UnitAuraSlot {
 impl UnitAuraSlot {
     /// A buff: the slot is in the positive half.
     pub fn is_helpful(&self) -> bool {
-        self.slot < UNIT_AURA_POSITIVE_SLOTS
+        self.slot < u16::from(UNIT_AURA_POSITIVE_SLOTS)
     }
     /// Whether the server will honour a `CMSG_CANCEL_AURA` for this aura.
     pub fn is_cancelable(&self) -> bool {
@@ -354,6 +357,8 @@ pub struct ObjectFields {
     values: Vec<u32>,
     /// The created type's [`descriptor_len`], below which absent reads 0; 0 for a delta or fixture.
     descriptor_end: u16,
+    /// Deviation: a negotiated full replacement; never part of the stock field mask.
+    extended_auras: Option<Vec<UnitAuraSlot>>,
 }
 
 /// An object's descriptor length in dwords: the `*_END` of its innermost block, so a Player spans
@@ -393,6 +398,7 @@ impl ObjectFields {
             present,
             values,
             descriptor_end: 0,
+            extended_auras: None,
         })
     }
 

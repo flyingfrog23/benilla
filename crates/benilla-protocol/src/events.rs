@@ -542,6 +542,8 @@ pub enum SessionEvent {
     },
     /// One chat line (`SMSG_MESSAGECHAT`); system lines (type `0x0A`) carry GM command feedback.
     Chat(crate::messages::ChatMessage),
+    /// Deviation: negotiated fork snapshots, separate from vanilla update fields.
+    ExtendedAuras(crate::messages::extended_auras::AuraSnapshot),
     /// A channel notice (`SMSG_CHANNEL_NOTIFY`); `notice` selects the `tail` payload.
     ChannelNotify {
         notice: u8,

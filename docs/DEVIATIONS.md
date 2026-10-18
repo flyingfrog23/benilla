@@ -29,12 +29,12 @@ A setting boots at the reference's default unless it is listed here (`docs/METHO
 
 Each entry is the first sentence of a `Deviation:` comment, linking to where it lives.
 
-- [benilla-app](#benilla-app): 217
+- [benilla-app](#benilla-app): 222
 - [benilla-assets](#benilla-assets): 6
 - [benilla-blp](#benilla-blp): 1
 - [benilla-formats](#benilla-formats): 17
 - [benilla-lua](#benilla-lua): 3
-- [benilla-protocol](#benilla-protocol): 21
+- [benilla-protocol](#benilla-protocol): 29
 - [benilla-srp](#benilla-srp): 2
 - [benilla-ui](#benilla-ui): 112
 - [benilla-world](#benilla-world): 46
@@ -51,6 +51,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - The stock FCF\_ChatTabFadeFinished (FloatingChatFrame.lua:989-992) nils oldAlpha even under a live hover, so leaving and re-entering within CHAT\_FRAME\_FADE\_TIME (a flick to the scroll buttons, outside the hover box, does it) stops the plate fading in (l.873) for the rest of the session; this keeps oldAlpha while hover is set. ([`assets/ui/FrameXMLFixes.xml:6`](../crates/benilla-app/assets/ui/FrameXMLFixes.xml#L6))
 - Re-runs UIParent\_ManageFramePositions after DurabilityFrame's own OnEvent. ([`assets/ui/FrameXMLFixes.xml:20`](../crates/benilla-app/assets/ui/FrameXMLFixes.xml#L20))
 - Friendly plates the player turned on come back at every world entry. The stock UpdateNameplates (UIOptionsFrame.lua:768-780) shows them and hides them again at once (l.775-776), and FRIENDNAMEPLATES\_ON is never saved, since l.182 registers NAMEPLATES\_ON a second time. ([`assets/ui/FrameXMLFixes.xml:33`](../crates/benilla-app/assets/ui/FrameXMLFixes.xml#L33))
+- Negotiated aura overflow UI, built into this fork; stock FrameXML stays intact. ([`assets/ui/FrameXMLFixes.xml:51`](../crates/benilla-app/assets/ui/FrameXMLFixes.xml#L51))
 - The rungs are the 1.15 era client's ESC menu, because its settings screens replace 1.12's, which are much worse to use; the era's AddOns rung is dropped, since the character-select AddOns screen is the only addon UI. ([`assets/ui/GameMenuAdapters.xml:4`](../crates/benilla-app/assets/ui/GameMenuAdapters.xml#L4))
 - The layout is the era Settings panel's Keybindings page (collapsible category sections), because 1.12's settings screens are much worse to use. ([`assets/ui/KeyBindingsPage.xml:5`](../crates/benilla-app/assets/ui/KeyBindingsPage.xml#L5))
 - Every bind, unbind and reset saves at once, as the era panel commits, where 1.12 had Okay and Cancel; only Reset To Default and leaving the character set confirm. ([`assets/ui/KeyBindingsPage.xml:11`](../crates/benilla-app/assets/ui/KeyBindingsPage.xml#L11))
@@ -162,6 +163,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### net
 
+- Opt-in fork aura snapshots, independent of the stock descriptor. ([`src/net/extended_auras.rs:1`](../crates/benilla-app/src/net/extended_auras.rs#L1))
 - The reference loads the world first and logs in after: the entry's first frame starts the load at the record's map and position (`0x401570`, called at `0x46c236`), and a later one, once its file reader is idle (`0x46c247`), sends the login (`0x46c272`). ([`src/net/io.rs:10`](../crates/benilla-app/src/net/io.rs#L10))
 - The reference re-dials only from `RequestRealmList`, and only when the link is down (`[CLoginMgr+5]` clear, `0x5ab857` → `0x5b2200`), with the reconnect challenge (`0x5b2134`, `[Logon+0xc]`); the connect's query sends only on a link in state 6 (`0x5bc14c`) and otherwise nothing, leaving the screen on its connecting dialog for good. ([`src/net/io.rs:399`](../crates/benilla-app/src/net/io.rs#L399))
 - The reference's guard at `0x537e85` sends 0 whenever the write index is 0, one ping in sixteen; we send 0 only before the first pong, because the rest is an artefact of its index arithmetic that only the server stores. ([`src/net/io.rs:1169`](../crates/benilla-app/src/net/io.rs#L1169))
@@ -279,9 +281,12 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### ui_aura
 
-- On a catalog miss the reference keeps the record's stale value (`0x4e4533`, `0x4e4550` skip the write); this answers from the joined expiry, because a stale value is no mechanism to reproduce. ([`src/ui_aura.rs:349`](../crates/benilla-app/src/ui_aura.rs#L349))
-- On other units' rows an id the catalog lacks stays visible, because every wire id is a real spell and failing closed would blank every aura on a catalog failure; the reference skips one there (`[0xc0d78c]`), though its player cache inserts one, as here. ([`src/ui_aura.rs:377`](../crates/benilla-app/src/ui_aura.rs#L377))
-- The reference never clears its expiry array (`0xbc5f68`); this does, because vmangos sends no durations at login to overwrite a kept stamp (`SMSG_UPDATE_AURA_DURATION` is an empty placeholder in `Player::SendInitialPacketsBeforeAddToMap`, `Player.cpp:19248`). ([`src/ui_aura.rs:635`](../crates/benilla-app/src/ui_aura.rs#L635))
+- Negotiated snapshots use independent u16 slots and replace these stamps. ([`src/ui_aura.rs:30`](../crates/benilla-app/src/ui_aura.rs#L30))
+- On a catalog miss the reference keeps the record's stale value (`0x4e4533`, `0x4e4550` skip the write); this answers from the joined expiry, because a stale value is no mechanism to reproduce. ([`src/ui_aura.rs:364`](../crates/benilla-app/src/ui_aura.rs#L364))
+- On other units' rows an id the catalog lacks stays visible, because every wire id is a real spell and failing closed would blank every aura on a catalog failure; the reference skips one there (`[0xc0d78c]`), though its player cache inserts one, as here. ([`src/ui_aura.rs:392`](../crates/benilla-app/src/ui_aura.rs#L392))
+- Own casts lead the player's cache as well as every other unit's list. Stable sort keeps the reference insertion order within each ownership group. ([`src/ui_aura.rs:470`](../crates/benilla-app/src/ui_aura.rs#L470))
+- Retry the built-in UI hook until FrameXML has loaded, then repaint only on changes. ([`src/ui_aura.rs:636`](../crates/benilla-app/src/ui_aura.rs#L636))
+- The reference never clears its expiry array (`0xbc5f68`); this does, because vmangos sends no durations at login to overwrite a kept stamp (`SMSG_UPDATE_AURA_DURATION` is an empty placeholder in `Player::SendInitialPacketsBeforeAddToMap`, `Player.cpp:19248`). ([`src/ui_aura.rs:668`](../crates/benilla-app/src/ui_aura.rs#L668))
 
 #### ui_binder
 
@@ -554,7 +559,8 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### events
 
-- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:668`](../crates/benilla-protocol/src/events.rs#L668))
+- Negotiated fork snapshots, separate from vanilla update fields. ([`src/events.rs:545`](../crates/benilla-protocol/src/events.rs#L545))
+- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:670`](../crates/benilla-protocol/src/events.rs#L670))
 
 #### examples
 
@@ -566,6 +572,8 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - Every row is kept, because the reference takes the count unclamped into its 80 row blocks and a larger one overruns them. ([`src/messages/battlefield.rs:98`](../crates/benilla-protocol/src/messages/battlefield.rs#L98))
 - A larger count keeps the first 40, where the reference's handler writes past the store. ([`src/messages/battlefield.rs:188`](../crates/benilla-protocol/src/messages/battlefield.rs#L188))
 - Text without a NUL stops at `length`, because the reference reads on out of bounds. ([`src/messages/broadcast.rs:29`](../crates/benilla-protocol/src/messages/broadcast.rs#L29))
+- An opt-in fork protocol beyond the reference's 48 fields (UnitDebuff 0x5198f0). ([`src/messages/extended_auras.rs:1`](../crates/benilla-protocol/src/messages/extended_auras.rs#L1))
+- This fork advertises support automatically; only the server enables it. ([`src/messages/extended_auras.rs:14`](../crates/benilla-protocol/src/messages/extended_auras.rs#L14))
 - The 1.12 client appends a zlib chat transcript to a category 2 ticket (`0x5ef936`); we omit it because vmangos never reads it and logs the leftover bytes. ([`src/messages/gm_ticket.rs:48`](../crates/benilla-protocol/src/messages/gm_ticket.rs#L48))
 - Zone and position are kept, not set to the viewer's zone and the object's position, because nothing in benilla reads them. ([`src/messages/group.rs:255`](../crates/benilla-protocol/src/messages/group.rs#L255))
 - String reads are unbounded. The reference `0x4191b0` caps each field, counting the NUL (roster name `0x30`, notes `0x80`, MOTD `0x200`, info `0x7d0`, guild name `0x60`, rank name `0x40`), and on overflow empties it and no-ops every later read in the packet. ([`src/messages/guild.rs:4`](../crates/benilla-protocol/src/messages/guild.rs#L4))
@@ -576,6 +584,11 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - A body too short for the position gives `None` where the client redisplays a stale global, because showing a stale queue position as current is a client bug. ([`src/messages/parse.rs:295`](../crates/benilla-protocol/src/messages/parse.rs#L295))
 - A type outside 1-7 reads as nothing rather than the reference's default arm, which under-pushes its returns. ([`src/messages/pet.rs:75`](../crates/benilla-protocol/src/messages/pet.rs#L75))
 - Both are read, told apart exactly by the tail length (`12n` vs `1 + 14n`), since the 1.12 client mis-parses vmangos's. ([`src/messages/pet.rs:195`](../crates/benilla-protocol/src/messages/pet.rs#L195))
+- u16 holds negotiated slots through 286; the unchanged vanilla duration packet still carries a u8 legacy slot. ([`src/messages/update_object/fields/mod.rs:153`](../crates/benilla-protocol/src/messages/update_object/fields/mod.rs#L153))
+- The extension carries the caster; legacy fields report 0 (unknown). ([`src/messages/update_object/fields/mod.rs:156`](../crates/benilla-protocol/src/messages/update_object/fields/mod.rs#L156))
+- A negotiated full replacement; never part of the stock field mask. ([`src/messages/update_object/fields/mod.rs:360`](../crates/benilla-protocol/src/messages/update_object/fields/mod.rs#L360))
+- The extension overrides aura accessors only after a valid snapshot. Legacy field merges continue independently for compatibility with vanilla descriptors. ([`src/messages/update_object/fields/unit.rs:42`](../crates/benilla-protocol/src/messages/update_object/fields/unit.rs#L42))
+- Own casts first, retaining slot order within each group. Unknown legacy casters keep the stock order. ([`src/messages/update_object/fields/unit.rs:217`](../crates/benilla-protocol/src/messages/update_object/fields/unit.rs#L217))
 
 #### world
 

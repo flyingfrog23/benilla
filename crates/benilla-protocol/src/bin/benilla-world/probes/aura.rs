@@ -71,7 +71,7 @@ impl Probe for Aura {
         // Survivors are not ours (Battle Stance, 2457, owns slot 0) and must report no duration:
         // the server sends `SMSG_UPDATE_AURA_DURATION` only on apply or refresh, never for a
         // permanent aura, which the 1.12 client shows as "until cancelled".
-        let untouched: Vec<u8> = fields.unit_auras().map(|a| a.slot).collect();
+        let untouched: Vec<u16> = fields.unit_auras().map(|a| a.slot).collect();
 
         println!("\nGM: .aura {AURA_BUFF_SPELL} {AURA_BUFF_SECONDS} (Mark of the Wild)");
         println!("GM: .aura {AURA_DEBUFF_SPELL} {AURA_DEBUFF_SECONDS} (Shadow Word: Pain)");
@@ -165,7 +165,7 @@ impl Probe for Aura {
         ] {
             let ms = durations
                 .iter()
-                .find(|(slot, _)| *slot == aura.slot)
+                .find(|(slot, _)| u16::from(*slot) == aura.slot)
                 .map(|&(_, ms)| ms)
                 .with_context(|| {
                     format!(
@@ -197,7 +197,7 @@ impl Probe for Aura {
         // Durations are apply/refresh edges, not a stream; the client counts down locally.
         if let Some(&slot) = untouched
             .iter()
-            .find(|s| durations.iter().any(|(d, _)| d == *s))
+            .find(|s| durations.iter().any(|(d, _)| u16::from(*d) == **s))
         {
             bail!(
                 "--aura: slot {slot} reported a duration without being (re)applied — durations are \

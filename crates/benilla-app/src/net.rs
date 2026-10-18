@@ -20,6 +20,7 @@ use crossbeam_channel::{Receiver, Sender};
 use benilla_world::schedule::WorldStage;
 
 mod apply;
+mod extended_auras;
 pub(crate) mod handlers;
 pub(crate) mod io;
 pub(crate) mod motion;

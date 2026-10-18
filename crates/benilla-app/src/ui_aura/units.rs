@@ -85,6 +85,7 @@ pub(super) struct UnitAuras {
     /// The last version handed out; every list change takes the next, so none repeats.
     versions: u64,
     catalog_present: bool,
+    me: u64,
     frame: u64,
     /// Kept to save the allocations: the inputs being read, and the walk over the guids a token
     /// can name, each with whether its roster record may stand in for it.
@@ -117,6 +118,7 @@ impl UnitAuras {
             catalog,
             catalog_moved,
         } = inputs;
+        self.me = me;
         self.frame += 1;
         if catalog_moved || catalog.is_some() != self.catalog_present {
             self.catalog_present = catalog.is_some();
@@ -202,6 +204,7 @@ impl UnitAuras {
         match store {
             Some(store) => self.scratch.extend(other_unit_inputs(
                 store,
+                self.me,
                 catalog,
                 buffs_visible(guid, store),
             )),

@@ -54,6 +54,7 @@ fn gameobject_despawn_anim(guid: u64, commands: &mut Commands, index: &GuidIndex
 
 /// Registers the object layer's handlers.
 pub(super) fn register(app: &mut App) {
+    super::extended_auras::register(app);
     use SessionEventKind as K;
     app.net_handler(K::ObjectCreate, on_object_create)
         .net_handler(K::ItemCreate, on_item)
@@ -82,6 +83,7 @@ pub(crate) struct Scene<'w, 's> {
     commands: Commands<'w, 's>,
     net: Res<'w, NetCommands>,
     index: ResMut<'w, GuidIndex>,
+    extended_auras: ResMut<'w, super::extended_auras::ExtendedAuras>,
     self_guid: Res<'w, SelfGuid>,
     real: Res<'w, Time<Real>>,
     transforms: Query<'w, 's, &'static mut Transform>,
@@ -190,9 +192,10 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         transport_progress,
         transport,
         spline,
-        fields,
+        mut fields,
     } = ev
     {
+        sc.extended_auras.apply(guid, &mut fields);
         crate::death::net::note_corpse(guid, kind, &fields, &sc.self_guid, &mut sc.death_net);
         let other_player =
             (kind == EntityKind::Player && sc.self_guid.0 != Some(guid)).then(|| fields.clone());
@@ -452,6 +455,7 @@ fn on_object_values(In(ev): In<SessionEvent>, mut sc: Scene) {
 /// the item's does (`0x5d8660`).
 fn on_object_destroyed(In(ev): In<SessionEvent>, mut sc: Scene) {
     if let SessionEvent::ObjectDestroyed(guid) = ev {
+        sc.extended_auras.0.remove(&guid);
         crate::death::net::forget_corpse(guid, &mut sc.death_net);
         let gone = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).destroyed(guid);
         sc.item_notices.write_batch(gone);
@@ -479,6 +483,7 @@ fn on_objects_removed(In(ev): In<SessionEvent>, mut sc: Scene) {
     if let SessionEvent::ObjectsRemoved(mut guids) = ev {
         guids.retain(|g| sc.self_guid.0 != Some(*g));
         for guid in &guids {
+            sc.extended_auras.0.remove(guid);
             let gone = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).destroyed(*guid);
             sc.item_notices.write_batch(gone);
             let held = |g: u64| sc.index.0.get(&g).and_then(|e| sc.stores.get(*e).ok());

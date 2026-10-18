@@ -144,12 +144,16 @@ impl WorldSession {
 
         // Sent plain; header encryption starts right after. The addon block is required (cmangos
         // kicks a zero-size one); `STOCK_SECURE_ADDONS` is what a stock 1.12.1 install reports.
+        let mut addons = messages::STOCK_SECURE_ADDONS.to_vec();
+        if messages::extended_auras::enabled() {
+            addons.push(messages::extended_auras::EXTENDED_AURA_ADDON);
+        }
         let body = messages::auth_session(
             u32::from(crate::CLIENT_BUILD),
             &username.to_uppercase(),
             client_seed,
             &client_proof,
-            &messages::STOCK_SECURE_ADDONS,
+            &addons,
         );
         send_packet(&mut stream, None, opcode::CMSG_AUTH_SESSION, &body)
             .context("sending CMSG_AUTH_SESSION")?;

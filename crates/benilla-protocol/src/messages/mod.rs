@@ -16,6 +16,7 @@ mod client;
 mod combat_log;
 mod death;
 mod duel;
+pub mod extended_auras;
 mod gameobject;
 mod gm_ticket;
 mod gossip;

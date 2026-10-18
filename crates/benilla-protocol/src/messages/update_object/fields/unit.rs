@@ -34,6 +34,17 @@ pub enum OwnerFallback {
 }
 
 impl ObjectFields {
+    /// Whether this object has received an authoritative negotiated aura list.
+    pub fn has_extended_auras(&self) -> bool {
+        self.extended_auras.is_some()
+    }
+
+    /// Deviation: the extension overrides aura accessors only after a valid snapshot.
+    /// Legacy field merges continue independently for compatibility with vanilla descriptors.
+    pub fn set_extended_auras(&mut self, auras: Vec<UnitAuraSlot>) {
+        self.extended_auras = Some(auras);
+    }
+
     /// `OBJECT_FIELD_SCALE_X`: the per-object size multiplier.
     pub fn object_scale_x(&self) -> Option<f32> {
         self.get_f32(FIELD_OBJECT_SCALE_X)
@@ -177,7 +188,8 @@ impl ObjectFields {
             .get_u32(FIELD_UNIT_AURA + u16::from(slot))
             .filter(|&id| id != 0)?;
         Some(UnitAuraSlot {
-            slot,
+            slot: u16::from(slot),
+            caster_guid: 0,
             spell_id,
             flags,
             level: self.get_aura_byte(FIELD_UNIT_AURALEVELS, slot),
@@ -191,13 +203,44 @@ impl ObjectFields {
     /// `UnitDebuff` read another unit in (`0x519500`, `0x5198f0`). The local player's buff bar
     /// keeps insertion order in a packed cache (`0xbc6040`) instead, which this cannot recover.
     pub fn unit_auras(&self) -> impl Iterator<Item = UnitAuraSlot> + '_ {
-        (0..UNIT_AURA_SLOTS).filter_map(|slot| self.unit_aura(slot))
+        let legacy_slots = if self.extended_auras.is_some() {
+            0
+        } else {
+            UNIT_AURA_SLOTS
+        };
+        self.extended_auras
+            .iter()
+            .flatten()
+            .copied()
+            .chain((0..legacy_slots).filter_map(|slot| self.unit_aura(slot)))
     }
+    /// Deviation: own casts first, retaining slot order within each group. Unknown legacy
+    /// casters keep the stock order. The same walk serves buffs and debuffs after filtering.
+    pub fn unit_auras_prioritizing(&self, caster: u64) -> impl Iterator<Item = UnitAuraSlot> + '_ {
+        self.unit_auras()
+            .filter(move |a| caster != 0 && a.caster_guid == caster)
+            .chain(
+                self.unit_auras()
+                    .filter(move |a| caster == 0 || a.caster_guid != caster),
+            )
+    }
+
     /// Every `UNIT_FIELD_AURA` slot's raw spell id, zeros and stale ids included, as the cast
     /// validator's crowd-control scan (`0x6e9ca0`) reads them, without `AURAFLAGS`.
     pub fn unit_aura_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..UNIT_AURA_SLOTS)
-            .map(|slot| self.get_u32(FIELD_UNIT_AURA + u16::from(slot)).unwrap_or(0))
+        let legacy_slots = if self.extended_auras.is_some() {
+            0
+        } else {
+            UNIT_AURA_SLOTS
+        };
+        self.extended_auras
+            .iter()
+            .flatten()
+            .map(|a| a.spell_id)
+            .chain(
+                (0..legacy_slots)
+                    .map(|slot| self.get_u32(FIELD_UNIT_AURA + u16::from(slot)).unwrap_or(0)),
+            )
     }
 
     /// `UNIT_FIELD_BYTES_0` byte 3: power type, 0 mana, 1 rage, 2 focus, 3 energy, 4 happiness.

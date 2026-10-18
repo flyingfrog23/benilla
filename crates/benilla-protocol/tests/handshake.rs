@@ -124,12 +124,18 @@ fn sends_before_the_split_are_observed_in_order() {
         .filter(|(t, ..)| *t == me)
         .map(|(_, op, body)| (*op, body.clone()))
         .collect();
+    let mut addons = messages::STOCK_SECURE_ADDONS.to_vec();
+    // Deviation: this fork offers extended auras automatically; the server can ignore the
+    // ordinary custom-addon record. BENILLA_EXTENDED_AURAS=0 preserves the retail handshake.
+    if messages::extended_auras::enabled() {
+        addons.push(messages::extended_auras::EXTENDED_AURA_ADDON);
+    }
     let auth_len = messages::auth_session(
         u32::from(benilla_protocol::CLIENT_BUILD),
         "ONE",
         0,
         &[0; 20],
-        &messages::STOCK_SECURE_ADDONS,
+        &addons,
     )
     .len();
     // The observer gets the bodies themselves: the auth block by its length (its proof is derived
