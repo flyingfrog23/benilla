@@ -20,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       # Open from the upstream branch directly: no fork ref or workflow file is rewritten by
       # GITHUB_TOKEN, and the merge retains this fork's own commits, including extended auras.
       - name: Open upstream merge pull request
@@ -32,6 +36,20 @@ jobs:
           if [ "$ahead" -eq 0 ]; then
             echo "No upstream commits to merge."
             exit 0
+          fi
+
+          # A squash merge keeps no upstream ancestry. Compare the resulting trees as well so
+          # already-imported commits do not open another PR after the previous one was squashed.
+          git fetch --no-tags https://github.com/samwhosung/benilla.git main
+          if merged_tree=$(git merge-tree --write-tree HEAD FETCH_HEAD); then
+            if [ "$merged_tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+              echo "All upstream changes are already present."
+              exit 0
+            fi
+          else
+            merge_status=$?
+            # Conflicts need a PR for resolution; other merge errors fail the run.
+            if [ "$merge_status" -ne 1 ]; then exit "$merge_status"; fi
           fi
 
           existing=$(gh api --method GET "repos/$REPO/pulls" \
