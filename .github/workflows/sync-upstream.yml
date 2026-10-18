@@ -1,19 +1,47 @@
 name: Sync upstream
 
+# In Settings > Actions > General, allow GitHub Actions to create pull requests.
 on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
+    if: github.repository != 'samwhosung/benilla'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Sync fork
+      # Open from the upstream branch directly: no fork ref or workflow file is rewritten by
+      # GITHUB_TOKEN, and the merge retains this fork's own commits, including extended auras.
+      - name: Open upstream merge pull request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-        run: gh repo sync "$REPO"
+        run: |
+          set -euo pipefail
+          ahead=$(gh api "repos/$REPO/compare/main...samwhosung:main" --jq '.ahead_by')
+          if [ "$ahead" -eq 0 ]; then
+            echo "No upstream commits to merge."
+            exit 0
+          fi
+
+          existing=$(gh api --method GET "repos/$REPO/pulls" \
+            -f state=open -f base=main -f head=samwhosung:main \
+            --jq '.[0].html_url // empty')
+          if [ -n "$existing" ]; then
+            echo "Upstream merge pull request already open: $existing"
+            exit 0
+          fi
+
+          gh pr create --repo "$REPO" --base main --head samwhosung:main \
+            --title "Merge upstream/main" \
+            --body "Merge the latest upstream commits while preserving this fork's changes. Resolve any conflicts and run the repository gates before merging."
