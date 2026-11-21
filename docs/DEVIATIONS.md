@@ -29,12 +29,12 @@ A setting boots at the reference's default unless it is listed here (`docs/METHO
 
 Each entry is the first sentence of a `Deviation:` comment, linking to where it lives.
 
-- [benilla-app](#benilla-app): 234
+- [benilla-app](#benilla-app): 239
 - [benilla-assets](#benilla-assets): 6
 - [benilla-blp](#benilla-blp): 1
 - [benilla-formats](#benilla-formats): 19
 - [benilla-lua](#benilla-lua): 11
-- [benilla-protocol](#benilla-protocol): 22
+- [benilla-protocol](#benilla-protocol): 30
 - [benilla-srp](#benilla-srp): 2
 - [benilla-ui](#benilla-ui): 122
 - [benilla-world](#benilla-world): 49
@@ -300,18 +300,12 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### ui_aura
 
-<<<<<<< HEAD
 - Negotiated snapshots use independent u16 slots and replace these stamps. ([`src/ui_aura.rs:30`](../crates/benilla-app/src/ui_aura.rs#L30))
-- On a catalog miss the reference keeps the record's stale value (`0x4e4533`, `0x4e4550` skip the write); this answers from the joined expiry, because a stale value is no mechanism to reproduce. ([`src/ui_aura.rs:364`](../crates/benilla-app/src/ui_aura.rs#L364))
-- On other units' rows an id the catalog lacks stays visible, because every wire id is a real spell and failing closed would blank every aura on a catalog failure; the reference skips one there (`[0xc0d78c]`), though its player cache inserts one, as here. ([`src/ui_aura.rs:392`](../crates/benilla-app/src/ui_aura.rs#L392))
-- Own casts lead the player's cache as well as every other unit's list. Stable sort keeps the reference insertion order within each ownership group. ([`src/ui_aura.rs:470`](../crates/benilla-app/src/ui_aura.rs#L470))
-- Retry the built-in UI hook until FrameXML has loaded, then repaint only on changes. ([`src/ui_aura.rs:636`](../crates/benilla-app/src/ui_aura.rs#L636))
-- The reference never clears its expiry array (`0xbc5f68`); this does, because vmangos sends no durations at login to overwrite a kept stamp (`SMSG_UPDATE_AURA_DURATION` is an empty placeholder in `Player::SendInitialPacketsBeforeAddToMap`, `Player.cpp:19248`). ([`src/ui_aura.rs:668`](../crates/benilla-app/src/ui_aura.rs#L668))
-=======
-- On a catalog miss the reference keeps the record's stale value (`0x4e4533`, `0x4e4550` skip the write); this answers from the joined expiry, because a stale value is no mechanism to reproduce. ([`src/ui_aura.rs:350`](../crates/benilla-app/src/ui_aura.rs#L350))
-- On other units' rows an id the catalog lacks stays visible, because every wire id is a real spell and failing closed would blank every aura on a catalog failure; the reference skips one there (`[0xc0d78c]`), though its player cache inserts one, as here. ([`src/ui_aura.rs:378`](../crates/benilla-app/src/ui_aura.rs#L378))
-- The reference never clears its expiry array (`0xbc5f68`); this does, because vmangos sends no durations at login to overwrite a kept stamp (`SMSG_UPDATE_AURA_DURATION` is an empty placeholder in `Player::SendInitialPacketsBeforeAddToMap`, `Player.cpp:19248`). ([`src/ui_aura.rs:640`](../crates/benilla-app/src/ui_aura.rs#L640))
->>>>>>> upstream/main
+- On a catalog miss the reference keeps the record's stale value (`0x4e4533`, `0x4e4550` skip the write); this answers from the joined expiry, because a stale value is no mechanism to reproduce. ([`src/ui_aura.rs:365`](../crates/benilla-app/src/ui_aura.rs#L365))
+- On other units' rows an id the catalog lacks stays visible, because every wire id is a real spell and failing closed would blank every aura on a catalog failure; the reference skips one there (`[0xc0d78c]`), though its player cache inserts one, as here. ([`src/ui_aura.rs:393`](../crates/benilla-app/src/ui_aura.rs#L393))
+- Own casts lead the player's cache as well as every other unit's list. Stable sort keeps the reference insertion order within each ownership group. ([`src/ui_aura.rs:474`](../crates/benilla-app/src/ui_aura.rs#L474))
+- Retry the built-in UI hook until FrameXML has loaded, then repaint only on changes. ([`src/ui_aura.rs:640`](../crates/benilla-app/src/ui_aura.rs#L640))
+- The reference never clears its expiry array (`0xbc5f68`); this does, because vmangos sends no durations at login to overwrite a kept stamp (`SMSG_UPDATE_AURA_DURATION` is an empty placeholder in `Player::SendInitialPacketsBeforeAddToMap`, `Player.cpp:19248`). ([`src/ui_aura.rs:673`](../crates/benilla-app/src/ui_aura.rs#L673))
 
 #### ui_binder
 
@@ -612,12 +606,8 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 
 #### events
 
-<<<<<<< HEAD
-- Negotiated fork snapshots, separate from vanilla update fields. ([`src/events.rs:545`](../crates/benilla-protocol/src/events.rs#L545))
-- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:670`](../crates/benilla-protocol/src/events.rs#L670))
-=======
-- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:669`](../crates/benilla-protocol/src/events.rs#L669))
->>>>>>> upstream/main
+- Negotiated fork snapshots, separate from vanilla update fields. ([`src/events.rs:546`](../crates/benilla-protocol/src/events.rs#L546))
+- `benilla::spell_mods` refuses an out-of-range pair, because the reference would overrun it. ([`src/events.rs:671`](../crates/benilla-protocol/src/events.rs#L671))
 
 #### examples
 
@@ -651,7 +641,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - The reference waits forever; a bound tells a server that died mid-queue from a long wait. ([`src/world/session.rs:17`](../crates/benilla-protocol/src/world/session.rs#L17))
 - Zeros until one does, where the reference's words are never initialised (the session is allocated without zero-fill, `ui/billing` in benilla-re). ([`src/world/session.rs:58`](../crates/benilla-protocol/src/world/session.rs#L58))
 - Checked per queue packet where the reference checks each tick, so a cancel can lag one server update. ([`src/world/session.rs:94`](../crates/benilla-protocol/src/world/session.rs#L94))
-- Benilla runs no Warden module and answers nothing, where the reference hands `SMSG_WARDEN_DATA` to the module its connect loads (`0x6ca2f0`, `0x6ca5c0`) and sends that module's answer as `CMSG_WARDEN_DATA` (`0x6ca6a0`). ([`src/world/session.rs:218`](../crates/benilla-protocol/src/world/session.rs#L218))
+- Benilla runs no Warden module and answers nothing, where the reference hands `SMSG_WARDEN_DATA` to the module its connect loads (`0x6ca2f0`, `0x6ca5c0`) and sends that module's answer as `CMSG_WARDEN_DATA` (`0x6ca6a0`). ([`src/world/session.rs:222`](../crates/benilla-protocol/src/world/session.rs#L222))
 ### benilla-srp
 
 #### (crate root)
@@ -766,7 +756,7 @@ Each entry is the first sentence of a `Deviation:` comment, linking to where it 
 - The reference reads uninitialised fields before the seed; we answer the first legal design because that value is undefined. ([`src/script/tabard.rs:103`](../crates/benilla-ui/src/script/tabard.rs#L103))
 - Returns nothing. The handler ends `mov eax,1` with nothing pushed (`0x4dcd7c`), so Lua 5.0 hands back the stack top, the node argument: an accident of the handler, not an API, and copying a stack-top leak would copy a bug. ([`src/script/taxi.rs:138`](../crates/benilla-ui/src/script/taxi.rs#L138))
 - A handler that unregisters the saved next ends the dispatch, because the reference then reads a freed node. ([`src/script/tick.rs:30`](../crates/benilla-ui/src/script/tick.rs#L30))
-- `0x530a52` lays it out at once; getters resolve first, so only OnSizeChanged fires later. ([`src/script/tooltip/size.rs:155`](../crates/benilla-ui/src/script/tooltip/size.rs#L155))
+- `0x530a52` lays it out at once; getters resolve first, so only OnSizeChanged fires later. ([`src/script/tooltip/size.rs:164`](../crates/benilla-ui/src/script/tooltip/size.rs#L164))
 - The reference's builder hides and clears on a missing record (`0x52b72e`..`0x52b73f`), where a source that knows the item's name shows that, because a blank plate under an on-screen name reads as broken; the template's arrival then builds it whole. ([`src/script/tooltip_item/build.rs:53`](../crates/benilla-ui/src/script/tooltip_item/build.rs#L53))
 - An object no longer held, or a source that keeps no guid (the player's own trade slot), rebuilds from the instance the build read, where the reference's lookup finds no object and builds from the record and the block alone; benilla's views carry no object to read once it is gone, and the kept instance is what the plate showed. ([`src/script/tooltip_item/build.rs:154`](../crates/benilla-ui/src/script/tooltip_item/build.rs#L154))
 - The reference's padding repeats a mana stat once per zero entry; not emulated, since only the internal test ring 6674 has one. ([`src/script/tooltip_item/render.rs:416`](../crates/benilla-ui/src/script/tooltip_item/render.rs#L416))
